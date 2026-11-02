@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sensenova-serve",
+      "runtimeExecutable": "target/release/sensenova-loop.exe",
+      "runtimeArgs": ["serve", "--port", "8080", "--ctx", "16384"],
+      "port": 8080
+    }
+  ]
+}
