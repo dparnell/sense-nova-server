@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::chat::{Detokenizer, Tokenizer, partial_suffix};
 use crate::engine::{Engine, SNAPSHOTS};
 use crate::sampler::{Sampler, SamplingParams};
+use crate::stats::Stats;
 
 pub struct GenRequest {
     pub prompt: Vec<u32>,
@@ -45,6 +46,8 @@ pub struct Finish {
     pub cached_tokens: usize,
     pub prefill_secs: f64,
     pub decode_secs: f64,
+    /// The client disconnected before generation finished.
+    pub cancelled: bool,
 }
 
 pub struct Worker {
@@ -54,15 +57,17 @@ pub struct Worker {
     /// Token prefix held by each snapshot slot, with a last-used counter for LRU eviction.
     snaps: Vec<Option<(Vec<u32>, u64)>>,
     clock: u64,
+    stats: Arc<Stats>,
 }
 
 /// Start the generation thread; requests are queued on the returned sender.
-pub fn spawn(engine: Engine, tok: Arc<Tokenizer>) -> mpsc::Sender<GenRequest> {
+/// Submitters must increment `stats.queued` for each request they send.
+pub fn spawn(engine: Engine, tok: Arc<Tokenizer>, stats: Arc<Stats>) -> mpsc::Sender<GenRequest> {
     let (tx, rx) = mpsc::channel::<GenRequest>();
     std::thread::Builder::new()
         .name("generation".into())
         .spawn(move || {
-            let mut w = Worker { engine, tok, live: Vec::new(), snaps: vec![None; SNAPSHOTS], clock: 0 };
+            let mut w = Worker { engine, tok, live: Vec::new(), snaps: vec![None; SNAPSHOTS], clock: 0, stats };
             for req in rx {
                 let events = req.events.clone();
                 if let Err(e) = w.run(req) {
@@ -70,6 +75,7 @@ pub fn spawn(engine: Engine, tok: Arc<Tokenizer>) -> mpsc::Sender<GenRequest> {
                     w.engine.reset();
                     w.live.clear();
                     w.snaps.iter_mut().for_each(|s| *s = None);
+                    w.stats.error(&format!("{e:#}"));
                     let _ = events.send(GenEvent::Error(format!("{e:#}")));
                 }
             }
@@ -89,6 +95,7 @@ impl Worker {
     fn run(&mut self, req: GenRequest) -> Result<()> {
         let ctx = self.engine.ctx;
         let prompt = &req.prompt;
+        self.stats.begin(prompt.len(), self.engine.pos);
         if prompt.is_empty() {
             bail!("empty prompt");
         }
@@ -113,9 +120,10 @@ impl Worker {
             self.live.clear();
         }
         let cached = self.live.len();
+        self.stats.begin_cached(cached, self.engine.pos);
 
         if let Some(s) = req.snapshot_at.filter(|&s| s > self.live.len() && s < prompt.len()) {
-            self.engine.forward(&prompt[self.live.len()..s], false)?;
+            self.feed(&prompt[self.live.len()..s], false)?;
             let slot = (0..self.snaps.len())
                 .min_by_key(|&i| self.snaps[i].as_ref().map_or(0, |(_, used)| *used))
                 .unwrap();
@@ -123,7 +131,7 @@ impl Worker {
             self.live = prompt[..s].to_vec();
             self.snaps[slot] = Some((self.live.clone(), self.clock));
         }
-        let mut logits = self.engine.forward(&prompt[self.live.len()..], true)?.unwrap();
+        let mut logits = self.feed(&prompt[self.live.len()..], true)?.unwrap();
         self.live = prompt.clone();
         let prefill_secs = t0.elapsed().as_secs_f64();
 
@@ -135,6 +143,7 @@ impl Worker {
         let mut generated = 0usize;
         let eos = self.engine.cfg.eos.clone();
         let mut reason = FinishReason::Length;
+        let mut cancelled = false;
         let send = |s: &str| req.events.send(GenEvent::Text(s.to_string())).is_ok();
 
         'decode: while generated < max_tokens {
@@ -157,7 +166,7 @@ impl Worker {
             }
             if let Some(c) = cut {
                 if c > sent && !send(&text[sent..c]) {
-                    return Ok(());
+                    cancelled = true;
                 }
                 sent = text.len();
                 reason = FinishReason::Stop;
@@ -167,27 +176,46 @@ impl Worker {
             let upto = text.len() - hold;
             if upto > sent {
                 if !send(&text[sent..upto]) {
-                    return Ok(()); // client went away
+                    cancelled = true; // client went away
+                    break;
                 }
                 sent = upto;
             }
             if generated >= max_tokens {
                 break;
             }
+            let t = Instant::now();
             logits = self.engine.forward(&[tok], true)?.unwrap();
             self.live.push(tok);
+            self.stats.decoded(generated, max_tokens, t.elapsed().as_secs_f64(), self.engine.pos);
         }
-        if sent < text.len() {
+        if sent < text.len() && !cancelled {
             send(&text[sent..]);
         }
-        let _ = req.events.send(GenEvent::Done(Finish {
+        let finish = Finish {
             reason,
             prompt_tokens: prompt.len(),
             completion_tokens: generated,
             cached_tokens: cached,
             prefill_secs,
             decode_secs: t1.elapsed().as_secs_f64(),
-        }));
+            cancelled,
+        };
+        self.stats.finish(&finish);
+        let _ = req.events.send(GenEvent::Done(finish));
         Ok(())
+    }
+
+    /// Feed prompt tokens one engine chunk at a time, reporting progress.
+    fn feed(&mut self, tokens: &[u32], want_logits: bool) -> Result<Option<Vec<f32>>> {
+        let chunk = self.engine.prefill_chunk;
+        let n = tokens.len().div_ceil(chunk);
+        let mut out = None;
+        for (i, c) in tokens.chunks(chunk).enumerate() {
+            let t = Instant::now();
+            out = self.engine.forward(c, want_logits && i + 1 == n)?;
+            self.stats.prefilled(c.len(), t.elapsed().as_secs_f64(), self.engine.pos);
+        }
+        Ok(out)
     }
 }

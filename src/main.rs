@@ -7,9 +7,12 @@ mod gpu;
 mod repl;
 mod sampler;
 mod server;
+mod stats;
+mod tui;
 mod weights;
 mod worker;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,6 +24,7 @@ use crate::chat::{ChatTemplate, Tokenizer};
 use crate::engine::Engine;
 use crate::gpu::Gpu;
 use crate::sampler::SamplingParams;
+use crate::stats::{Output, Stats};
 use crate::weights::DType;
 
 const DEFAULT_REPO: &str = "sensenova/SenseNova-Loop-9B-Preview";
@@ -103,6 +107,9 @@ enum Command {
         /// Return reasoning inline as <think>...</think> in `content` instead of `reasoning_content`.
         #[arg(long)]
         inline_reasoning: bool,
+        /// Print plain log lines instead of the live dashboard.
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Measure prompt processing and generation speed.
     Bench {
@@ -292,7 +299,7 @@ fn main() -> Result<()> {
         }
         Command::Run { model, sampling, prompt, system, hide_reasoning, stats } => {
             let l = load(&cli, model)?;
-            let tx = worker::spawn(l.engine, l.tok.clone());
+            let tx = worker::spawn(l.engine, l.tok.clone(), Arc::new(Stats::new(Output::Quiet)));
             repl::run(
                 tx,
                 l.tok,
@@ -308,11 +315,22 @@ fn main() -> Result<()> {
                 prompt.clone(),
             )?;
         }
-        Command::Serve { model, sampling, host, port, api_key, served_model_name, inline_reasoning } => {
+        Command::Serve { model, sampling, host, port, api_key, served_model_name, inline_reasoning, no_tui } => {
             let l = load(&cli, model)?;
             let ctx = l.engine.ctx;
             let im_start = l.tok.token_id("<|im_start|>");
-            let tx = worker::spawn(l.engine, l.tok.clone());
+            let addr = format!("{host}:{port}");
+            let use_tui = !no_tui && std::io::stdout().is_terminal();
+            let stats = Arc::new(Stats::new(if use_tui { Output::Tui } else { Output::Print }));
+            let info = tui::Info {
+                url: format!("http://{addr}/v1"),
+                model_id: served_model_name.clone(),
+                quant: l.engine.quant.clone(),
+                gpu: l.engine.gpu.info.clone(),
+                ctx,
+                model_bytes: l.engine.gpu.allocated.get(),
+            };
+            let tx = worker::spawn(l.engine, l.tok.clone(), stats.clone());
             let state = Arc::new(server::AppState {
                 cfg: server::ServerConfig {
                     model_name: served_model_name.clone(),
@@ -327,11 +345,22 @@ fn main() -> Result<()> {
                 template: l.template,
                 im_start,
                 ctx,
+                stats: stats.clone(),
             });
-            let addr = format!("{host}:{port}");
             tokio::runtime::Runtime::new()?.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
-                eprintln!("OpenAI-compatible API on http://{addr}/v1 (model id `{served_model_name}`)");
+                if use_tui {
+                    std::thread::spawn(move || {
+                        let res = tui::run(info, stats);
+                        if let Err(e) = res {
+                            eprintln!("dashboard error: {e:#}");
+                        }
+                        // Quitting the dashboard stops the server, even mid-request.
+                        std::process::exit(0);
+                    });
+                } else {
+                    eprintln!("OpenAI-compatible API on http://{addr}/v1 (model id `{served_model_name}`)");
+                }
                 axum::serve(listener, server::router(state))
                     .with_graceful_shutdown(async {
                         let _ = tokio::signal::ctrl_c().await;

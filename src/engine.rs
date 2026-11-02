@@ -130,7 +130,7 @@ pub struct Engine {
     /// Number of tokens currently held in the caches.
     pub pos: usize,
     /// Tokens per prefill submission and ops per GPU submission, smaller on slow GPUs.
-    prefill_chunk: usize,
+    pub prefill_chunk: usize,
     ops_per_submit: usize,
     slow_gpu: bool,
     profile: Option<std::cell::RefCell<std::collections::HashMap<String, (f64, usize)>>>,
@@ -438,7 +438,12 @@ impl Engine {
             ctx,
             quant,
             kernels,
-            weights: wf,
+            // Re-map the file so the pages read during upload leave this
+            // process's resident memory; afterwards only embedding rows are touched.
+            weights: {
+                drop(wf);
+                Arc::new(WeightFile::open(path)?)
+            },
             step,
             x,
             logits,

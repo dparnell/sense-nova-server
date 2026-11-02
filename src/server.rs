@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::chat::{ChatTemplate, OutputParser, Piece, Tokenizer, ToolCall};
 use crate::sampler::SamplingParams;
+use crate::stats::Stats;
 use crate::worker::{Finish, FinishReason, GenEvent, GenRequest};
 
 pub struct ServerConfig {
@@ -37,6 +38,7 @@ pub struct AppState {
     pub template: ChatTemplate,
     pub im_start: Option<u32>,
     pub ctx: usize,
+    pub stats: Arc<Stats>,
 }
 
 type Shared = Arc<AppState>;
@@ -169,22 +171,12 @@ fn submit(st: &AppState, prompt: Vec<u32>, snapshot_at: Option<usize>, c: &Commo
         stop: c.stop.clone(),
         events: tx.clone(),
     };
+    st.stats.queued.fetch_add(1, Ordering::Relaxed);
     if st.tx.lock().unwrap().send(req).is_err() {
+        st.stats.queued.fetch_sub(1, Ordering::Relaxed);
         let _ = tx.send(GenEvent::Error("generation thread has stopped".into()));
     }
     rx
-}
-
-fn log_finish(f: &Finish) {
-    let new = f.prompt_tokens - f.cached_tokens;
-    eprintln!(
-        "request: prompt {} tok ({} cached, {:.0} tok/s), generated {} tok ({:.1} tok/s)",
-        f.prompt_tokens,
-        f.cached_tokens,
-        new as f64 / f.prefill_secs.max(1e-9),
-        f.completion_tokens,
-        f.completion_tokens as f64 / f.decode_secs.max(1e-9),
-    );
 }
 
 fn thinking_enabled(st: &AppState, b: &Value) -> bool {
@@ -283,7 +275,6 @@ async fn chat_once(
             GenEvent::Text(t) => add(parser.push(&t)),
             GenEvent::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e, "server_error"),
             GenEvent::Done(f) => {
-                log_finish(&f);
                 let (rest, calls) = parser.finish(tools);
                 add(rest);
                 let mut message = json!({"role": "assistant", "content": content});
@@ -352,7 +343,6 @@ fn chat_stream(
                     break;
                 }
                 GenEvent::Done(f) => {
-                    log_finish(&f);
                     let (rest, calls) = parser.finish(tools.as_ref());
                     for p in rest {
                         yield Ok(chunk(piece_delta(p), None));
@@ -418,7 +408,6 @@ async fn completions(State(st): State<Shared>, Json(b): Json<Value>) -> Response
                         break;
                     }
                     GenEvent::Done(f) => {
-                        log_finish(&f);
                         let mut last = chunk("", Some(finish_reason(&f, false)));
                         if include_usage {
                             last["usage"] = usage(&f);
@@ -438,7 +427,6 @@ async fn completions(State(st): State<Shared>, Json(b): Json<Value>) -> Response
             GenEvent::Text(t) => text.push_str(&t),
             GenEvent::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e, "server_error"),
             GenEvent::Done(f) => {
-                log_finish(&f);
                 return Json(json!({
                     "id": id,
                     "object": "text_completion",

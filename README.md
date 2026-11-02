@@ -56,6 +56,15 @@ Or answer a single prompt:
 ./target/release/sensenova-loop serve --port 8080
 ```
 
+In a terminal, `serve` shows a live dashboard: what the model is doing right
+now (reading the prompt or generating, with progress and context use), charts
+of generation and prompt-processing speed, GPU load and VRAM use over time,
+GPU temperature and power, the process's CPU and RAM, request totals and a
+table of recent requests with their speed and outcome. Press `q` (or Ctrl+C)
+to stop the server. GPU load, VRAM, temperature and power come from NVIDIA's
+NVML; on other GPUs the chart shows how busy the engine kept the GPU instead.
+Use `--no-tui` (or redirect the output) for plain one-line-per-request logs.
+
 Point any OpenAI client at `http://127.0.0.1:8080/v1` (any API key works unless
 you pass `--api-key`). The model id is `sensenova_loop`, but any model name is
 accepted.
@@ -102,7 +111,7 @@ fed back through the model's chat template.
 | `pull [REPO] [--quant q8_0\|q4_0] [--delete-source]` | Download and quantize a model |
 | `convert <DIR> [--quant ...]` | Quantize an already-downloaded Hugging Face checkpoint |
 | `run [-p PROMPT] [--system TEXT] [--hide-reasoning] [--stats]` | Terminal chat (`/think`, `/nothink`, `/reset`, `/system`, `/exit`) |
-| `serve [--host] [--port] [--api-key] [--served-model-name] [--inline-reasoning]` | OpenAI-compatible server |
+| `serve [--host] [--port] [--api-key] [--served-model-name] [--inline-reasoning] [--no-tui]` | OpenAI-compatible server with a live dashboard |
 | `devices` | List usable GPUs |
 | `bench` | Measure prompt processing and generation speed |
 
@@ -134,7 +143,8 @@ so the model costs about as much per token as a ~14B dense model.
 
 GPU memory needed is roughly the weight file plus ~60 KB per context token
 (about 11.4 GB for Q8_0 at a 32K context). If generation is unexpectedly slow,
-other applications may be holding GPU memory and forcing the driver to page:
+other applications may be holding GPU memory and forcing the driver to page
+(the dashboard's VRAM bar turns red when the card is full):
 lower `--ctx` or use `--quant q4_0`. On Windows, prefer the Vulkan backend
 (the default); DX12 works but compiles shaders slowly and runs slower.
 
