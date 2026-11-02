@@ -34,7 +34,10 @@ impl Safetensors {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
-            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("model")))
+            .filter(|p| p.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("model") || n.starts_with("mtp")
+            }))
             .collect();
         files.sort();
         if files.is_empty() {
@@ -116,6 +119,8 @@ enum Source {
     WeightBias(String, String),
     /// A [rows, cols] (or [rows]) tensor zero-padded to the planned shape.
     Pad(String),
+    /// Columns `start..start + n` of a [rows, cols] matrix.
+    Cols(String, usize),
 }
 
 /// Which part of the checkpoint to convert.
@@ -123,6 +128,8 @@ enum Source {
 pub enum Part {
     Text,
     Vision,
+    /// The multi-token-prediction head used for speculative decoding.
+    Mtp,
 }
 
 struct Planned {
@@ -190,6 +197,31 @@ fn plan_vision(cfg: &ModelConfig, st: &Safetensors) -> Result<Vec<Planned>> {
     vector(o, st, "vm.fc1_b".into(), vec![format!("{m}.linear_fc1.bias")])?;
     matrix(o, st, "vm.fc2".into(), q8, vec![format!("{m}.linear_fc2.weight")])?;
     vector(o, st, "vm.fc2_b".into(), vec![format!("{m}.linear_fc2.bias")])?;
+    Ok(out)
+}
+
+/// The MTP head: `fc` is split into its embedding and hidden-state halves, and
+/// its decoder layer is fused like a main full-attention layer. Kept at 8 bits.
+fn plan_mtp(cfg: &ModelConfig, st: &Safetensors) -> Result<Vec<Planned>> {
+    let h = cfg.hidden;
+    let q8 = DType::Q8_0;
+    let mut out = Vec::new();
+    let o = &mut out;
+    for (name, start) in [("mtp.fc_e", 0), ("mtp.fc_h", h)] {
+        o.push(Planned { name: name.into(), dtype: q8, shape: vec![h, h], source: Source::Cols("mtp.fc.weight".into(), start) });
+    }
+    vector(o, st, "mtp.norm_e".into(), vec!["mtp.pre_fc_norm_embedding.weight".into()])?;
+    vector(o, st, "mtp.norm_h".into(), vec!["mtp.pre_fc_norm_hidden.weight".into()])?;
+    vector(o, st, "mtp.norm".into(), vec!["mtp.norm.weight".into()])?;
+    let p = "mtp.layers.0";
+    let a = format!("{p}.self_attn");
+    vector(o, st, "mtp.in_ln".into(), vec![format!("{p}.input_layernorm.weight")])?;
+    vector(o, st, "mtp.post_ln".into(), vec![format!("{p}.post_attention_layernorm.weight")])?;
+    vector(o, st, "mtp.qk_norm".into(), vec![format!("{a}.q_norm.weight"), format!("{a}.k_norm.weight")])?;
+    matrix(o, st, "mtp.qkv".into(), q8, vec![format!("{a}.q_proj.weight"), format!("{a}.k_proj.weight"), format!("{a}.v_proj.weight")])?;
+    matrix(o, st, "mtp.o_proj".into(), q8, vec![format!("{a}.o_proj.weight")])?;
+    matrix(o, st, "mtp.gate_up".into(), q8, vec![format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")])?;
+    matrix(o, st, "mtp.down".into(), q8, vec![format!("{p}.mlp.down_proj.weight")])?;
     Ok(out)
 }
 
@@ -293,8 +325,9 @@ pub fn convert(src: &Path, dst: &Path, quant: DType, model_name: &str, part: Par
     let planned = match part {
         Part::Text => plan(&cfg, &st, quant)?,
         Part::Vision => plan_vision(&cfg, &st)?,
+        Part::Mtp => plan_mtp(&cfg, &st)?,
     };
-    let quant = if part == Part::Vision { DType::Q8_0 } else { quant };
+    let quant = if part == Part::Text { quant } else { DType::Q8_0 };
 
     // Lay out every tensor before writing so the header can be written first.
     let mut tensors = BTreeMap::new();
@@ -356,6 +389,15 @@ pub fn convert(src: &Path, dst: &Path, quant: DType, model_name: &str, part: Par
                     v[r * cols..r * cols + src_cols].copy_from_slice(&src[r * src_cols..(r + 1) * src_cols]);
                 }
                 v
+            }
+            Source::Cols(name, start) => {
+                let src = st.read(name)?;
+                let src_cols = st.shape(name)?[1];
+                let (rows, cols) = (info.rows(), info.cols());
+                if src.len() != rows * src_cols || start + cols > src_cols {
+                    bail!("{}: column slice does not fit `{name}`", t.name);
+                }
+                src.chunks_exact(src_cols).flat_map(|r| r[*start..start + cols].iter().copied()).collect()
             }
         };
         let (rows, cols) = (info.rows(), info.cols());

@@ -18,6 +18,8 @@ use crate::weights::{DType, WeightFile, dequant_q8_row};
 pub const MAX_M: usize = 512;
 /// Number of recurrent-state snapshots kept for prefix reuse across requests.
 pub const SNAPSHOTS: usize = 4;
+/// Most token rows whose logits one forward pass returns (speculative verification).
+pub const LOGIT_ROWS: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -25,7 +27,8 @@ struct StepU {
     m: u32,
     pos0: u32,
     parts: u32,
-    _pad: u32,
+    /// > 0: linear layers also save their state after token `ckpt - 1`.
+    ckpt: u32,
 }
 
 #[repr(C)]
@@ -51,7 +54,7 @@ struct LayerP {
     weight_one: f32,
     iterations: u32,
     inter: u32,
-    _pad: u32,
+    x_stride: u32,
 }
 
 #[repr(C)]
@@ -120,8 +123,19 @@ enum K {
     Delta,
 }
 
+/// How many token rows a matrix op multiplies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// All rows of the step.
+    Step,
+    /// A fixed number of rows.
+    Fixed(usize),
+    /// The output head: the number of rows whose logits were requested.
+    Head,
+}
+
 enum Op {
-    Mat { dtype: DType, groups: Vec<(wgpu::BindGroup, usize)>, m_one: bool },
+    Mat { dtype: DType, groups: Vec<(wgpu::BindGroup, usize)>, rows: Rows },
     /// mHC router dot products: (9, M) workgroups.
     MhcDots { bg: wgpu::BindGroup },
     /// One workgroup per token (or a single one for the final norm).
@@ -148,10 +162,25 @@ pub struct Engine {
     staging: wgpu::Buffer,
     lin_state: wgpu::Buffer,
     conv_state: wgpu::Buffer,
-    /// Saved recurrent states, one (linear, conv) pair per snapshot slot.
-    snaps: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    /// Linear state after the first token of a verification step, for rollback.
+    lin_ckpt: wgpu::Buffer,
+    conv_ckpt: wgpu::Buffer,
+    /// Saved (linear, conv, last hidden) states, one per snapshot slot.
+    snaps: Vec<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>,
     ops: Vec<Op>,
-    final_ops: Vec<Op>,
+    /// Final norm of every row into `hid` rows 1..=m, then the output head.
+    final_norm_op: Op,
+    head_op: Op,
+    /// Per-chunk uniforms of the output head, rewritten for the requested rows.
+    head_params: Vec<(wgpu::Buffer, MatP)>,
+    head_rows: usize,
+    /// Normed final hidden states: row 0 is the token before the last step, rows 1..=m the step.
+    hid: wgpu::Buffer,
+    /// Hidden state of the last token in the cache (row 0 of the next step).
+    hlast: wgpu::Buffer,
+    /// Rows of `hid` written by the last step.
+    hid_rows: usize,
+    mtp: Option<Mtp>,
     /// Number of tokens currently held in the caches.
     pub pos: usize,
     /// Tokens per prefill submission and ops per GPU submission, smaller on slow GPUs.
@@ -163,10 +192,28 @@ pub struct Engine {
     pub vision: Option<crate::vision::Vision>,
 }
 
+/// The multi-token-prediction head: one extra decoder layer that drafts the
+/// token after next from the last hidden state and the token just sampled.
+struct Mtp {
+    step: wgpu::Buffer,
+    x: wgpu::Buffer,
+    hn: wgpu::Buffer,
+    norm_h: wgpu::Buffer,
+    /// Layer params for the hidden-state norm (input rows of stride `hidden`).
+    norm_h_p: wgpu::Buffer,
+    /// Embedding norm, then (after the per-call hidden norm) fc, the decoder layer.
+    pre: Op,
+    ops: Vec<Op>,
+    head: Vec<Op>,
+    logits: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    coef: wgpu::Buffer,
+}
+
 fn op_label(op: &Op) -> String {
     match op {
-        Op::Mat { groups, m_one, .. } => {
-            format!("mat n={}{}", groups.iter().map(|g| g.1).sum::<usize>(), if *m_one { " (head)" } else { "" })
+        Op::Mat { groups, rows, .. } => {
+            format!("mat n={}{}", groups.iter().map(|g| g.1).sum::<usize>(), if *rows != Rows::Step { " (head)" } else { "" })
         }
         Op::PerToken { kind, .. } | Op::Elementwise { kind, .. } | Op::Fixed { kind, .. } => format!("{kind:?}"),
         Op::AttnPrep { .. } => "AttnPrep".into(),
@@ -180,7 +227,7 @@ fn align256(x: u64) -> u64 {
 }
 
 impl Engine {
-    pub fn load(gpu: Gpu, path: &Path, ctx: usize, vision: Option<&Path>) -> Result<Self> {
+    pub fn load(gpu: Gpu, path: &Path, ctx: usize, vision: Option<&Path>, mtp: Option<&Path>) -> Result<Self> {
         let wf = Arc::new(WeightFile::open(path)?);
         let cfg = wf.header.config.clone();
         let kernels = Kernels::new(&gpu)?;
@@ -214,10 +261,12 @@ impl Engine {
         let coef = gpu.storage("coef", f(MAX_M * 8));
         let partial = gpu.storage("partial", f(cfg.n_heads * MAX_M * (cfg.head_dim + 2)));
         let rpos = gpu.storage("rope_pos", (MAX_M * 16) as u64);
-        let logits = gpu.storage("logits", f(cfg.vocab));
+        let logits = gpu.storage("logits", f(LOGIT_ROWS * cfg.vocab));
+        let hid = gpu.storage("hidden", f((MAX_M + 1) * h));
+        let hlast = gpu.storage("hidden_last", f(h));
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("logits staging"),
-            size: f(cfg.vocab),
+            size: f(LOGIT_ROWS * cfg.vocab),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -235,8 +284,16 @@ impl Engine {
         let conv_bytes = align256(f(3 * cfg.conv_dim()));
         let lin_state = gpu.storage("lin_state", state_bytes * n_lin as u64);
         let conv_state = gpu.storage("conv_state", conv_bytes * n_lin as u64);
+        let lin_ckpt = gpu.storage("lin_ckpt", state_bytes * n_lin as u64);
+        let conv_ckpt = gpu.storage("conv_ckpt", conv_bytes * n_lin as u64);
         let snaps = (0..SNAPSHOTS)
-            .map(|_| (gpu.storage("lin_snap", state_bytes * n_lin as u64), gpu.storage("conv_snap", conv_bytes * n_lin as u64)))
+            .map(|_| {
+                (
+                    gpu.storage("lin_snap", state_bytes * n_lin as u64),
+                    gpu.storage("conv_snap", conv_bytes * n_lin as u64),
+                    gpu.storage("hidden_snap", f(h)),
+                )
+            })
             .collect();
 
         // ---- per-layer weights ----
@@ -276,29 +333,33 @@ impl Engine {
 
         // ---- op graph ----
         let k = &kernels;
-        let mat = |w: &QWeight, x: &wgpu::Buffer, x_stride: usize, y: &wgpu::Buffer, y_stride: usize, m_one: bool| -> Op {
+        let mat_s = |step: &wgpu::Buffer, w: &QWeight, x: &wgpu::Buffer, x_stride: usize, y: &wgpu::Buffer, y_stride: usize, rows: Rows| {
+            let mut params = Vec::new();
             let groups = w
                 .chunks
                 .iter()
-                .map(|(qb, sb, rows, r0)| {
-                    let p = gpu.uniform(
-                        "mat",
-                        &MatP {
-                            n: *rows as u32,
-                            k: w.k as u32,
-                            x_off: 0,
-                            x_stride: x_stride as u32,
-                            y_off: 0,
-                            y_stride: y_stride as u32,
-                            n_off: *r0 as u32,
-                            m_one: m_one as u32,
-                        },
-                    );
-                    let res = [Res::Whole(&step), Res::Whole(&p), Res::Whole(x), Res::Whole(qb), Res::Whole(sb), Res::Whole(y)];
-                    (bind_group(&gpu, k.matmul(w.dtype, MatKind::Tiled), "mat", &res), *rows)
+                .map(|(qb, sb, n, r0)| {
+                    let mp = MatP {
+                        n: *n as u32,
+                        k: w.k as u32,
+                        x_off: 0,
+                        x_stride: x_stride as u32,
+                        y_off: 0,
+                        y_stride: y_stride as u32,
+                        n_off: *r0 as u32,
+                        m_one: if let Rows::Fixed(r) = rows { r as u32 } else { 0 },
+                    };
+                    let p = gpu.uniform("mat", &mp);
+                    let res = [Res::Whole(step), Res::Whole(&p), Res::Whole(x), Res::Whole(qb), Res::Whole(sb), Res::Whole(y)];
+                    let bg = bind_group(&gpu, k.matmul(w.dtype, MatKind::Tiled), "mat", &res);
+                    params.push((p, mp));
+                    (bg, *n)
                 })
                 .collect();
-            Op::Mat { dtype: w.dtype, groups, m_one }
+            (Op::Mat { dtype: w.dtype, groups, rows }, params)
+        };
+        let mat = |w: &QWeight, x: &wgpu::Buffer, x_stride: usize, y: &wgpu::Buffer, y_stride: usize, one: bool| -> Op {
+            mat_s(&step, w, x, x_stride, y, y_stride, if one { Rows::Fixed(1) } else { Rows::Step }).0
         };
         let layer_p = |mode: u32, last_row: bool| LayerP {
             h: h as u32,
@@ -308,12 +369,15 @@ impl Engine {
             weight_one: 1.0,
             iterations: cfg.mhc.as_ref().map_or(0, |m| m.iterations as u32),
             inter: cfg.intermediate as u32,
-            _pad: 0,
+            x_stride: 0,
         };
         // layers.wgsl bindings: x, coef, w, out
-        let layer_bg = |kern: &Kernel, p: LayerP, xb: &wgpu::Buffer, w: &wgpu::Buffer, out: &wgpu::Buffer, coef_b: &wgpu::Buffer| {
+        let layer_bg_s = |step: &wgpu::Buffer, kern: &Kernel, p: LayerP, xb: &wgpu::Buffer, w: &wgpu::Buffer, out: Res, coef_b: &wgpu::Buffer| {
             let pb = gpu.uniform("layer", &p);
-            bind_group(&gpu, kern, "layer", &[Res::Whole(&step), Res::Whole(&pb), Res::Whole(xb), Res::Whole(coef_b), Res::Whole(w), Res::Whole(out)])
+            bind_group(&gpu, kern, "layer", &[Res::Whole(step), Res::Whole(&pb), Res::Whole(xb), Res::Whole(coef_b), Res::Whole(w), out])
+        };
+        let layer_bg = |kern: &Kernel, p: LayerP, xb: &wgpu::Buffer, w: &wgpu::Buffer, out: &wgpu::Buffer, coef_b: &wgpu::Buffer| {
+            layer_bg_s(&step, kern, p, xb, w, Res::Whole(out), coef_b)
         };
 
         let mut ops = Vec::new();
@@ -394,6 +458,8 @@ impl Engine {
                         Res::Range(&conv_state, conv_bytes * lin_slot as u64, f(3 * cfg.conv_dim())),
                         Res::Range(&lin_state, state_bytes * lin_slot as u64, state_bytes),
                         Res::Whole(&l.small), Res::Whole(&attn_out),
+                        Res::Range(&conv_ckpt, conv_bytes * lin_slot as u64, f(3 * cfg.conv_dim())),
+                        Res::Range(&lin_ckpt, state_bytes * lin_slot as u64, state_bytes),
                     ])
                 };
                 ops.push(Op::Fixed { kind: K::Conv, bg: res(&k.conv), x: cfg.conv_dim().div_ceil(256) as u32 });
@@ -417,10 +483,101 @@ impl Engine {
 
         let mut final_p = layer_p(0, true);
         final_p.weight_one = 1.0;
-        let final_ops = vec![
-            Op::PerToken { kind: K::BranchNorm, bg: layer_bg(&k.branch_norm, final_p, &x, &final_norm, &xn, &coef), single: true },
-            mat(&lm_head, &xn, h, &logits, cfg.vocab, true),
-        ];
+        let _ = final_p;
+        let hid_rows_bytes = f(MAX_M * h);
+        let final_norm_op = Op::PerToken {
+            kind: K::BranchNorm,
+            bg: layer_bg_s(&step, &k.branch_norm, layer_p(0, false), &x, &final_norm, Res::Range(&hid, f(h), hid_rows_bytes), &coef),
+            single: false,
+        };
+        let (head_op, head_params) = mat_s(&step, &lm_head, &hid, h, &logits, cfg.vocab, Rows::Head);
+
+        let mtp = match mtp {
+            None => None,
+            Some(mp) => {
+                let mw = WeightFile::open(mp)?;
+                let q = |n: &str| crate::engine::upload_q(&gpu, &mw, n);
+                let fv = |n: &str| crate::engine::upload_f(&gpu, &mw, n);
+                let mstep = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mtp step"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let mx = gpu.storage("mtp_x", f(MAX_M * 2 * h));
+                let hn = gpu.storage("mtp_hn", f(MAX_M * h));
+                let (fc_e, fc_h) = (q("mtp.fc_e")?, q("mtp.fc_h")?);
+                let (norm_e, norm_h, norm_out) = (fv("mtp.norm_e")?, fv("mtp.norm_h")?, fv("mtp.norm")?);
+                let (in_ln, post_ln, qk_norm) = (fv("mtp.in_ln")?, fv("mtp.post_ln")?, fv("mtp.qk_norm")?);
+                let (qkv, o_proj, gate_up, down) = (q("mtp.qkv")?, q("mtp.o_proj")?, q("mtp.gate_up")?, q("mtp.down")?);
+                let kc = gpu.storage("mtp_kcache", kv_bytes);
+                let vc = gpu.storage("mtp_vcache", kv_bytes);
+                let m_logits = gpu.storage("mtp_logits", f(cfg.vocab));
+                let m_staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mtp staging"),
+                    size: f(cfg.vocab),
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let lbg = |kern: &Kernel, p: LayerP, xb: &wgpu::Buffer, w: &wgpu::Buffer, out: &wgpu::Buffer| {
+                    layer_bg_s(&mstep, kern, p, xb, w, Res::Whole(out), &coef)
+                };
+                let mm = |w: &QWeight, x: &wgpu::Buffer, xs: usize, y: &wgpu::Buffer, ys: usize, rows: Rows| mat_s(&mstep, w, x, xs, y, ys, rows).0;
+                let merge0 = || Op::Elementwise { kind: K::Merge, bg: lbg(&k.merge, layer_p(0, false), &mx, &d_w, &branch), width: h };
+                let pre = Op::PerToken { kind: K::BranchNorm, bg: lbg(&k.branch_norm, layer_p(0, false), &mx, &norm_e, &xn), single: false };
+                let stride = cfg.attn_proj_rows();
+                let ap = gpu.uniform(
+                    "mtp attn",
+                    &AttnP {
+                        n_heads: cfg.n_heads as u32,
+                        n_kv: cfg.n_kv_heads as u32,
+                        rot_dim: cfg.rot_dim as u32,
+                        proj_stride: stride as u32,
+                        rope_theta: cfg.rope_theta,
+                        eps: cfg.eps,
+                        scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+                        mrope: ((3 * cfg.mrope_section[1]) << 16 | (3 * cfg.mrope_section[2])) as u32,
+                    },
+                );
+                let res = |kern: &Kernel| {
+                    bind_group(&gpu, kern, "mtp attn", &[
+                        Res::Whole(&mstep), Res::Whole(&ap), Res::Whole(&proj), Res::Whole(&qbuf), Res::Whole(&kc),
+                        Res::Whole(&vc), Res::Whole(&qk_norm), Res::Whole(&attn_out), Res::Whole(&partial),
+                        Res::Whole(&rpos),
+                    ])
+                };
+                let ops = vec![
+                    // x = fc_e(norm_e(embedding)) + fc_h(norm_h(hidden))
+                    mm(&fc_e, &xn, h, &mx, 2 * h, Rows::Step),
+                    mm(&fc_h, &hn, h, &branch, h, Rows::Step),
+                    merge0(),
+                    Op::PerToken { kind: K::BranchNorm, bg: lbg(&k.branch_norm, layer_p(0, false), &mx, &in_ln, &xn), single: false },
+                    mm(&qkv, &xn, h, &proj, stride, Rows::Step),
+                    Op::AttnPrep { bg: res(&k.attn_prep), slots: (cfg.n_heads + 2 * cfg.n_kv_heads) as u32 },
+                    Op::Attend { bg: res(&k.attend), heads: cfg.n_kv_heads as u32 },
+                    Op::PerToken { kind: K::Combine, bg: res(&k.combine), single: false },
+                    mm(&o_proj, &attn_out, cfg.q_dim(), &branch, h, Rows::Step),
+                    merge0(),
+                    Op::PerToken { kind: K::BranchNorm, bg: lbg(&k.branch_norm, layer_p(0, false), &mx, &post_ln, &xn), single: false },
+                    mm(&gate_up, &xn, h, &proj, 2 * cfg.intermediate, Rows::Step),
+                    Op::Elementwise { kind: K::Swiglu, bg: lbg(&k.swiglu, layer_p(0, false), &proj, &d_w, &act), width: cfg.intermediate },
+                    mm(&down, &act, cfg.intermediate, &branch, h, Rows::Step),
+                    merge0(),
+                ];
+                let head = vec![
+                    Op::PerToken { kind: K::BranchNorm, bg: lbg(&k.branch_norm, layer_p(0, true), &mx, &norm_out, &xn), single: true },
+                    mm(&lm_head, &xn, h, &m_logits, cfg.vocab, Rows::Fixed(1)),
+                ];
+                let mut hp = layer_p(0, false);
+                hp.x_stride = h as u32;
+                let norm_h_p = gpu.uniform("mtp norm_h", &hp);
+                keep.extend([kc, vc, ap, norm_e, norm_out, in_ln, post_ln, qk_norm]);
+                for w in [fc_e, fc_h, qkv, o_proj, gate_up, down] {
+                    keep.extend(w.chunks.into_iter().flat_map(|(q, s, _, _)| [q, s]));
+                }
+                Some(Mtp { step: mstep, x: mx, hn, norm_h, norm_h_p, pre, ops, head, logits: m_logits, staging: m_staging, coef: coef.clone() })
+            }
+        };
 
         // Keep every GPU resource referenced by the bind groups alive.
         keep.extend([xn, proj, act, attn_out, branch, qbuf, coef, partial, final_norm, d_w, mhc_raw]);
@@ -459,9 +616,18 @@ impl Engine {
             staging,
             lin_state,
             conv_state,
+            lin_ckpt,
+            conv_ckpt,
             snaps,
             ops,
-            final_ops,
+            final_norm_op,
+            head_op,
+            head_params,
+            head_rows: 1,
+            hid,
+            hlast,
+            hid_rows: 0,
+            mtp,
             pos: 0,
             prefill_chunk,
             ops_per_submit,
@@ -490,27 +656,123 @@ impl Engine {
         enc.clear_buffer(&self.conv_state, 0, None);
         self.gpu.queue.submit([enc.finish()]);
         self.pos = 0;
+        self.hid_rows = 0;
     }
 
     /// Save the recurrent state in `slot` so that `restore` can rewind to the current position.
     pub fn snapshot(&mut self, slot: usize) {
-        let (lin, conv) = &self.snaps[slot];
+        let (lin, conv, hl) = &self.snaps[slot];
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(&self.lin_state, 0, lin, 0, self.lin_state.size());
         enc.copy_buffer_to_buffer(&self.conv_state, 0, conv, 0, self.conv_state.size());
+        enc.copy_buffer_to_buffer(&self.hlast, 0, hl, 0, self.hlast.size());
         self.gpu.queue.submit([enc.finish()]);
     }
 
     /// Rewind to the snapshot in `slot`, taken at `pos`. KV entries before
     /// `pos` are still valid because later tokens only write positions >= `pos`.
     pub fn restore(&mut self, slot: usize, pos: usize) {
-        let (lin, conv) = &self.snaps[slot];
+        let (lin, conv, hl) = &self.snaps[slot];
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(lin, 0, &self.lin_state, 0, self.lin_state.size());
         enc.copy_buffer_to_buffer(conv, 0, &self.conv_state, 0, self.conv_state.size());
+        enc.copy_buffer_to_buffer(hl, 0, &self.hlast, 0, self.hlast.size());
         self.gpu.queue.submit([enc.finish()]);
         self.pos = pos;
+        self.hid_rows = 0;
     }
+
+    /// Undo the second token of a two-token verification step (its draft was
+    /// rejected): restore the linear state checkpointed after the first token.
+    /// KV entries need no undo; the next step overwrites them.
+    pub fn rollback(&mut self) {
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.lin_ckpt, 0, &self.lin_state, 0, self.lin_state.size());
+        enc.copy_buffer_to_buffer(&self.conv_ckpt, 0, &self.conv_state, 0, self.conv_state.size());
+        let h = self.cfg.hidden as u64 * 4;
+        enc.copy_buffer_to_buffer(&self.hid, h, &self.hlast, 0, h);
+        self.gpu.queue.submit([enc.finish()]);
+        self.pos -= 1;
+        self.hid_rows = 1;
+    }
+
+    /// Token rows of the last forward step (hidden rows 1..=n).
+    pub fn hid_rows(&self) -> usize {
+        self.hid_rows
+    }
+
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// Run the MTP head on pairs (hidden row `r0 + i` of the last step, `tokens[i]`),
+    /// where row 0 is the token before that step and `tokens[i]` is the token
+    /// following that row. Pairs go into MTP cache slots `slot0..` with rotary
+    /// positions `pos` (those of the hidden rows' tokens). With `draft`, returns
+    /// the MTP's guess for the token after the last pair's token.
+    pub fn mtp(&mut self, r0: usize, tokens: &[u32], pos: &[[u32; 3]], slot0: usize, draft: bool) -> Result<Option<u32>> {
+        let Some(mt) = &self.mtp else { return Ok(None) };
+        let n = tokens.len();
+        if n == 0 || pos.len() != n || r0 + n > self.hid_rows + 1 {
+            bail!("mtp: rows out of range");
+        }
+        let h = self.cfg.hidden;
+        let mut c0 = 0;
+        while c0 < n {
+            let c1 = (c0 + MAX_M).min(n);
+            let m = c1 - c0;
+            let total = slot0 + c1;
+            let parts = if m <= 4 { total.div_ceil(256).clamp(1, 64) } else { 1 };
+            self.gpu.queue.write_buffer(&mt.step, 0, bytemuck::bytes_of(&StepU {
+                m: m as u32,
+                pos0: (slot0 + c0) as u32,
+                parts: parts as u32,
+                ckpt: 0,
+            }));
+            self.gpu.queue.write_buffer(&mt.x, 0, bytemuck::cast_slice(&self.embed(&tokens[c0..c1])?));
+            let rp: Vec<[u32; 4]> = pos[c0..c1].iter().map(|p| [p[0], p[1], p[2], 0]).collect();
+            self.gpu.queue.write_buffer(&self.rpos, 0, bytemuck::cast_slice(&rp));
+            let hb = h as u64 * 4;
+            let norm_h = Op::PerToken {
+                kind: K::BranchNorm,
+                bg: bind_group(&self.gpu, &self.kernels.branch_norm, "mtp norm_h", &[
+                    Res::Whole(&mt.step),
+                    Res::Whole(&mt.norm_h_p),
+                    Res::Range(&self.hid, hb * (r0 + c0) as u64, hb * m as u64),
+                    Res::Whole(&mt.coef),
+                    Res::Whole(&mt.norm_h),
+                    Res::Whole(&mt.hn),
+                ]),
+                single: false,
+            };
+            let last = c1 == n;
+            let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                self.record(&mut pass, &mt.pre, m, parts);
+                self.record(&mut pass, &norm_h, m, parts);
+                for op in &mt.ops {
+                    self.record(&mut pass, op, m, parts);
+                }
+                if last && draft {
+                    for op in &mt.head {
+                        self.record(&mut pass, op, m, parts);
+                    }
+                }
+            }
+            if last && draft {
+                enc.copy_buffer_to_buffer(&mt.logits, 0, &mt.staging, 0, mt.staging.size());
+            }
+            self.gpu.queue.submit([enc.finish()]);
+            c0 = c1;
+        }
+        if draft {
+            let logits = self.gpu.map_read(&self.mtp.as_ref().unwrap().staging)?;
+            return Ok(Some(crate::sampler::argmax(&logits)));
+        }
+        Ok(None)
+    }
+
 
     fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         let h = self.cfg.hidden;
@@ -530,7 +792,7 @@ impl Engine {
     /// Feed text `tokens` at the current position, with rotary positions equal to
     /// cache positions. Returns logits for the last token when asked.
     pub fn forward(&mut self, tokens: &[u32], want_logits: bool) -> Result<Option<Vec<f32>>> {
-        self.forward_mm(tokens, None, &[], want_logits)
+        self.forward_mm(tokens, None, &[], want_logits as usize, false)
     }
 
     /// Feed `tokens` at the current cache position. `pos` gives each token's
@@ -541,8 +803,13 @@ impl Engine {
         tokens: &[u32],
         pos: Option<&[[u32; 3]]>,
         embeds: &[(usize, &[f32])],
-        want_logits: bool,
+        logit_rows: usize,
+        ckpt: bool,
     ) -> Result<Option<Vec<f32>>> {
+        let want_logits = logit_rows > 0;
+        if logit_rows > LOGIT_ROWS || (ckpt && tokens.len() != 2) {
+            bail!("forward: unsupported logits or checkpoint request");
+        }
         if tokens.is_empty() {
             bail!("forward called with no tokens");
         }
@@ -562,8 +829,17 @@ impl Engine {
                 m: m as u32,
                 pos0: self.pos as u32,
                 parts: parts as u32,
-                _pad: 0,
+                ckpt: ckpt as u32,
             }));
+            let rows = logit_rows.min(m);
+            if last && want_logits {
+                self.head_rows = rows;
+                let h = self.cfg.hidden;
+                for (buf, base) in &self.head_params {
+                    let mp = MatP { x_off: ((m - rows + 1) * h) as u32, m_one: rows as u32, ..*base };
+                    self.gpu.queue.write_buffer(buf, 0, bytemuck::bytes_of(&mp));
+                }
+            }
             let t_start = std::time::Instant::now();
             let c0 = ci * self.prefill_chunk;
             let mut emb = self.embed(chunk)?;
@@ -582,7 +858,8 @@ impl Engine {
 
             if let Some(prof) = &self.profile {
                 // Profiling: run each op on its own and wait for it.
-                let ops = self.ops.iter().chain(if last && want_logits { &self.final_ops[..] } else { &[] });
+                let head: &[Op] = if last && want_logits { std::slice::from_ref(&self.head_op) } else { &[] };
+                let ops = self.ops.iter().chain(std::iter::once(&self.final_norm_op)).chain(head);
                 // Time each op run once and 21 times; the difference cancels submit overhead.
                 // Repeated ops corrupt the activations, so profiling output is for timing only.
                 for op in ops {
@@ -607,13 +884,16 @@ impl Engine {
                     e.1 += 1;
                 }
             }
+            let hb = self.cfg.hidden as u64 * 4;
             let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+            // Row 0 of `hid` is the hidden state of the token before this step.
+            enc.copy_buffer_to_buffer(&self.hlast, 0, &self.hid, 0, hb);
             if self.profile.is_none() {
                 // Split the pass into several submissions so no single one runs
                 // long enough to trip the OS GPU watchdog on slow devices.
                 // A single decode step is short on discrete GPUs, and extra submissions
                 // leave the GPU idle between them, so only split prefill there.
-                let per_submit = if m > 1 || self.slow_gpu { self.ops_per_submit } else { self.ops.len() };
+                let per_submit = if m > LOGIT_ROWS || self.slow_gpu { self.ops_per_submit } else { self.ops.len() };
                 for (gi, group) in self.ops.chunks(per_submit).enumerate() {
                     if gi > 0 {
                         self.gpu.queue.submit([std::mem::replace(
@@ -627,15 +907,16 @@ impl Engine {
                         self.record(&mut pass, op, m, parts);
                     }
                 }
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                self.record(&mut pass, &self.final_norm_op, m, parts);
                 if last && want_logits {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
-                    for op in &self.final_ops {
-                        self.record(&mut pass, op, m, parts);
-                    }
+                    self.record(&mut pass, &self.head_op, m, parts);
                 }
             }
+            enc.copy_buffer_to_buffer(&self.hid, hb * m as u64, &self.hlast, 0, hb);
             if last && want_logits {
-                enc.copy_buffer_to_buffer(&self.logits, 0, &self.staging, 0, self.staging.size());
+                let bytes = (rows * self.cfg.vocab * 4) as u64;
+                enc.copy_buffer_to_buffer(&self.logits, 0, &self.staging, 0, bytes);
             }
             let t_rec = std::time::Instant::now();
             self.gpu.queue.submit([enc.finish()]);
@@ -643,9 +924,11 @@ impl Engine {
                 eprintln!("record {:.2}ms submit {:.2}ms", (t_rec - t_start).as_secs_f64() * 1e3, t_rec.elapsed().as_secs_f64() * 1e3);
             }
             self.pos += m;
+            self.hid_rows = m;
         }
         if want_logits {
-            return Ok(Some(self.gpu.map_read(&self.staging)?));
+            let rows = logit_rows.min(tokens.len() - (n_chunks - 1) * self.prefill_chunk);
+            return Ok(Some(self.gpu.map_read_n(&self.staging, rows * self.cfg.vocab)?));
         }
         // Keep the CPU from running far ahead of the GPU on long prompts.
         self.gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
@@ -681,8 +964,12 @@ impl Engine {
     fn record(&self, pass: &mut wgpu::ComputePass, op: &Op, m: usize, parts: usize) {
         let split = |n: u32| if n <= 65535 { (n, 1) } else { (65535, n.div_ceil(65535)) };
         match op {
-            Op::Mat { dtype, groups, m_one } => {
-                let rows_m = if *m_one { 1 } else { m };
+            Op::Mat { dtype, groups, rows } => {
+                let rows_m = match rows {
+                    Rows::Step => m,
+                    Rows::Fixed(r) => *r,
+                    Rows::Head => self.head_rows,
+                };
                 let kind = MatKind::for_rows(rows_m);
                 pass.set_pipeline(&self.kernels.matmul(*dtype, kind).pipeline);
                 for (bg, rows) in groups {
@@ -690,7 +977,7 @@ impl Engine {
                     if let MatKind::Tiled = kind {
                         pass.dispatch_workgroups(rows.div_ceil(128) as u32, rows_m.div_ceil(128) as u32, 1);
                     } else {
-                        let (gx, gy) = split(rows.div_ceil(8) as u32);
+                        let (gx, gy) = split(rows.div_ceil(kind.rows_per_group()) as u32);
                         pass.dispatch_workgroups(gx, gy, 1);
                     }
                 }

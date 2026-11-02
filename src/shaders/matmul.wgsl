@@ -23,7 +23,7 @@ struct Params {
     y_off: u32,
     y_stride: u32,
     n_off: u32,      // first output column written by this chunk
-    m_one: u32,      // 1: ignore step.m and use a single row
+    m_one: u32,      // > 0: ignore step.m and use this many rows
 }
 
 @group(0) @binding(0) var<uniform> step: Step;
@@ -34,7 +34,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
 
 fn rows_m() -> u32 {
-    if (p.m_one == 1u) { return 1u; }
+    if (p.m_one > 0u) { return p.m_one; }
     return step.m;
 }
 
@@ -99,43 +99,101 @@ fn matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
-// Single-row fast path (decode): scalar accumulators and two blocks in flight per lane.
-var<workgroup> red1: array<f32, 256>;
+// One- and two-row paths (decode and speculative verification). Each 32-lane
+// group owns MV_ROWS weight rows: a lane loads a block of x into registers once
+// and applies it to all of its rows, which keeps the kernel bound by weight
+// bandwidth rather than by re-reading x for every row.
+const MV_ROWS: u32 = 4u;
+var<workgroup> red1: array<f32, 1024>;
+var<workgroup> red2: array<f32, 1024>;
+
+fn load_x(base: u32) -> array<vec4<f32>, 8> {
+    return array<vec4<f32>, 8>(x[base], x[base + 1u], x[base + 2u], x[base + 3u],
+                               x[base + 4u], x[base + 5u], x[base + 6u], x[base + 7u]);
+}
+
+// Sum lane partials of `red1` (and `red2`) in place; lane 0 of each row ends with the total.
+fn reduce_rows(lid: u32, lane: u32, two: bool) {
+    workgroupBarrier();
+    for (var s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            for (var r = 0u; r < MV_ROWS; r++) {
+                red1[r * 256u + lid] += red1[r * 256u + lid + s];
+                if (two) { red2[r * 256u + lid] += red2[r * 256u + lid + s]; }
+            }
+        }
+        workgroupBarrier();
+    }
+}
 
 @compute @workgroup_size(256)
 fn matvec1(@builtin(workgroup_id) wid: vec3<u32>,
            @builtin(num_workgroups) nwg: vec3<u32>,
            @builtin(local_invocation_index) lid: u32) {
     let group = wid.x + wid.y * nwg.x;
-    let row = group * 8u + lid / 32u;
+    let row0 = (group * 8u + lid / 32u) * MV_ROWS;
     let lane = lid % 32u;
     let nb = p.k / 32u;
     let xb = p.x_off / 4u;
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    if (row < p.n) {
-        let rb = row * nb;
-        var b = lane;
-        loop {
-            if (b + 32u >= nb) { break; }
-            let s0 = ws[rb + b];
-            let s1 = ws[rb + b + 32u];
-            acc0 += s0 * block_dot((rb + b) * BLOCK_VEC4S, xb + b * 8u);
-            acc1 += s1 * block_dot((rb + b + 32u) * BLOCK_VEC4S, xb + (b + 32u) * 8u);
-            b += 64u;
-        }
-        if (b < nb) {
-            acc0 += ws[rb + b] * block_dot((rb + b) * BLOCK_VEC4S, xb + b * 8u);
+    var acc: array<f32, 4>;
+    for (var r = 0u; r < MV_ROWS; r++) { acc[r] = 0.0; }
+    if (row0 < p.n) {
+        let rows = min(MV_ROWS, p.n - row0);
+        for (var b = lane; b < nb; b += 32u) {
+            var xv = load_x(xb + b * 8u);
+            for (var r = 0u; r < rows; r++) {
+                let rb = (row0 + r) * nb + b;
+                acc[r] += ws[rb] * block_dot_v(rb * BLOCK_VEC4S, &xv);
+            }
         }
     }
-    red1[lid] = acc0 + acc1;
-    workgroupBarrier();
-    for (var s = 16u; s > 0u; s >>= 1u) {
-        if (lane < s) { red1[lid] += red1[lid + s]; }
-        workgroupBarrier();
+    for (var r = 0u; r < MV_ROWS; r++) { red1[r * 256u + lid] = acc[r]; }
+    reduce_rows(lid, lane, false);
+    if (lane == 0u) {
+        for (var r = 0u; r < MV_ROWS; r++) {
+            if (row0 + r < p.n) { y[p.y_off + p.n_off + row0 + r] = red1[r * 256u + lid]; }
+        }
     }
-    if (lane == 0u && row < p.n) {
-        y[p.y_off + p.n_off + row] = red1[lid];
+}
+
+@compute @workgroup_size(256)
+fn matvec2(@builtin(workgroup_id) wid: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>,
+           @builtin(local_invocation_index) lid: u32) {
+    let group = wid.x + wid.y * nwg.x;
+    let row0 = (group * 8u + lid / 32u) * MV_ROWS;
+    let lane = lid % 32u;
+    let nb = p.k / 32u;
+    let xa = p.x_off / 4u;
+    let xc = (p.x_off + p.x_stride) / 4u;
+    var acc0: array<f32, 4>;
+    var acc1: array<f32, 4>;
+    for (var r = 0u; r < MV_ROWS; r++) { acc0[r] = 0.0; acc1[r] = 0.0; }
+    if (row0 < p.n) {
+        let rows = min(MV_ROWS, p.n - row0);
+        for (var b = lane; b < nb; b += 32u) {
+            var x0 = load_x(xa + b * 8u);
+            var x1 = load_x(xc + b * 8u);
+            for (var r = 0u; r < rows; r++) {
+                let rb = (row0 + r) * nb + b;
+                let s = ws[rb];
+                acc0[r] += s * block_dot_v(rb * BLOCK_VEC4S, &x0);
+                acc1[r] += s * block_dot_v(rb * BLOCK_VEC4S, &x1);
+            }
+        }
+    }
+    for (var r = 0u; r < MV_ROWS; r++) {
+        red1[r * 256u + lid] = acc0[r];
+        red2[r * 256u + lid] = acc1[r];
+    }
+    reduce_rows(lid, lane, true);
+    if (lane == 0u) {
+        for (var r = 0u; r < MV_ROWS; r++) {
+            if (row0 + r < p.n) {
+                y[p.y_off + p.n_off + row0 + r] = red1[r * 256u + lid];
+                y[p.y_off + p.y_stride + p.n_off + row0 + r] = red2[r * 256u + lid];
+            }
+        }
     }
 }
 

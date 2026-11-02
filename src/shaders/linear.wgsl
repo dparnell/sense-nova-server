@@ -7,7 +7,7 @@ struct Step {
     m: u32,
     pos0: u32,
     parts: u32,
-    _pad: u32,
+    ckpt: u32,  // > 0: also save the state after token ckpt - 1 (speculative rollback)
 }
 
 struct Params {
@@ -32,6 +32,8 @@ const DV: u32 = 128u;
 @group(0) @binding(5) var<storage, read_write> state: array<f32>;      // [n_v, DK, DV]
 @group(0) @binding(6) var<storage, read> lw: array<f32>;              // conv w [conv_dim*4] | A_log[nv] | dt_bias[nv] | norm[DV]
 @group(0) @binding(7) var<storage, read_write> out: array<f32>;        // [M, n_v * DV]
+@group(0) @binding(8) var<storage, read_write> conv_ckpt: array<f32>;  // like conv_state
+@group(0) @binding(9) var<storage, read_write> state_ckpt: array<f32>; // like state
 
 // Depthwise causal conv (kernel 4) + SiLU, one thread per channel walking the tokens.
 @compute @workgroup_size(256)
@@ -52,6 +54,11 @@ fn conv(@builtin(global_invocation_id) gid: vec3<u32>) {
         r0 = r1;
         r1 = r2;
         r2 = cur;
+        if (m + 1u == step.ckpt) {
+            conv_ckpt[c] = r0;
+            conv_ckpt[p.conv_dim + c] = r1;
+            conv_ckpt[2u * p.conv_dim + c] = r2;
+        }
     }
     conv_state[c] = r0;
     conv_state[p.conv_dim + c] = r1;
@@ -124,6 +131,9 @@ fn delta(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index)
         let var_o = reduce2(j, vec2<f32>(o * o, 0.0)).x / f32(DV);
         let z = proj[prow + z_off + h * DV + j];
         out[m * p.n_v * DV + h * DV + j] = o * inverseSqrt(var_o + p.eps) * norm_w * (z / (1.0 + exp(-z)));
+        if (m + 1u == step.ckpt) {
+            for (var i = 0u; i < DK; i++) { state_ckpt[sbase + i * DV + j] = s[i]; }
+        }
     }
 
     for (var i = 0u; i < DK; i++) { state[sbase + i * DV + j] = s[i]; }

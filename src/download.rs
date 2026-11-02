@@ -19,6 +19,7 @@ fn wanted(path: &str) -> bool {
             | "tokenizer_config.json"
             | "chat_template.jinja"
             | "model.safetensors.index.json"
+            | "mtp.safetensors"
     ) || (path.starts_with("model") && path.ends_with(".safetensors") && !path.contains('/'))
 }
 

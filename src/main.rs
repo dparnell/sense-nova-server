@@ -187,6 +187,10 @@ struct ModelArgs {
     /// Skip loading the vision encoder (text only, saves ~0.5 GB of GPU memory).
     #[arg(long)]
     no_vision: bool,
+    /// Generate one token per step instead of drafting a second token with
+    /// the model's multi-token-prediction head (speculative decoding).
+    #[arg(long)]
+    no_mtp: bool,
 }
 
 #[derive(Args)]
@@ -263,6 +267,7 @@ fn repo_dir(root: &Path, repo: &str) -> PathBuf {
 }
 
 const VISION_FILE: &str = "vision.snl";
+const MTP_FILE: &str = "mtp.snl";
 
 fn snl_name(quant: DType) -> String {
     format!("model-{}.snl", quant.name())
@@ -292,6 +297,11 @@ fn convert_into(source: &Path, out_dir: &Path, quant: DType, name: &str) -> Resu
     if has_vision && weights::WeightFile::open(&vision).is_err() {
         println!("Converting the vision encoder to {} ...", vision.display());
         convert::convert(source, &vision, DType::Q8_0, name, convert::Part::Vision)?;
+    }
+    let mtp = out_dir.join(MTP_FILE);
+    if source.join("mtp.safetensors").exists() && weights::WeightFile::open(&mtp).is_err() {
+        println!("Converting the multi-token prediction head to {} ...", mtp.display());
+        convert::convert(source, &mtp, DType::Q8_0, name, convert::Part::Mtp)?;
     }
     Ok(dst)
 }
@@ -331,7 +341,9 @@ fn load(cli: &Cli, m: &ModelArgs) -> Result<Loaded> {
     let t = Instant::now();
     let vision_file = dir.join(VISION_FILE);
     let vision = (!m.no_vision && vision_file.exists()).then_some(vision_file.as_path());
-    let engine = Engine::load(gpu, &file, m.ctx, vision)?;
+    let mtp_file = dir.join(MTP_FILE);
+    let mtp = (!m.no_mtp && mtp_file.exists()).then_some(mtp_file.as_path());
+    let engine = Engine::load(gpu, &file, m.ctx, vision, mtp)?;
     eprintln!(
         "Loaded {} [{}] in {:.1}s, context {} tokens, {:.1} GB of GPU memory",
         file.display(),
@@ -491,11 +503,11 @@ fn main() -> Result<()> {
                 let mut last = None;
                 for i in 0..p.tokens.len() {
                     let e: Vec<(usize, &[f32])> = embeds.iter().filter(|(j, _)| *j == i).map(|(_, r)| (0, *r)).collect();
-                    last = l.engine.forward_mm(&p.tokens[i..i + 1], Some(&p.pos[i..i + 1]), &e, true)?;
+                    last = l.engine.forward_mm(&p.tokens[i..i + 1], Some(&p.pos[i..i + 1]), &e, 1, false)?;
                 }
                 last.unwrap()
             } else {
-                l.engine.forward_mm(&p.tokens, Some(&p.pos), &embeds, true)?.unwrap()
+                l.engine.forward_mm(&p.tokens, Some(&p.pos), &embeds, 1, false)?.unwrap()
             };
             println!("{} tokens, {} from the image ({}x{} patches)", p.tokens.len(), media.tokens(), media.h, media.w);
             if let Some(d) = dump {
@@ -548,6 +560,28 @@ fn main() -> Result<()> {
             let tg = t.elapsed().as_secs_f64();
             println!("prompt processing: {:.1} tok/s ({} tokens in {:.2}s)", *prompt_tokens as f64 / pp, prompt_tokens, pp);
             println!("generation:        {:.1} tok/s ({} tokens in {:.2}s)", *gen_tokens as f64 / tg, gen_tokens, tg);
+            if e.has_mtp() {
+                // Cost of the pieces of one speculative step.
+                let n = 32;
+                let pos = e.pos;
+                let t = Instant::now();
+                for _ in 0..n {
+                    e.forward_mm(&[1000, 1001], None, &[], 2, true)?;
+                    e.rollback();
+                }
+                let verify = t.elapsed().as_secs_f64() / n as f64;
+                let t = Instant::now();
+                for _ in 0..n {
+                    e.mtp(1, &[1000], &[[pos as u32; 3]], pos - 1, true)?;
+                }
+                let draft = t.elapsed().as_secs_f64() / n as f64;
+                println!(
+                    "speculative step:  draft {:.1} ms + verify 2 tokens {:.1} ms (one token alone: {:.1} ms)",
+                    draft * 1e3,
+                    verify * 1e3,
+                    tg / *gen_tokens as f64 * 1e3
+                );
+            }
             e.print_profile();
         }
     }

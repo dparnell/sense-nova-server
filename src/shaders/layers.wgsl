@@ -19,7 +19,7 @@ struct Params {
     weight_one: f32, // 1.0 for zero-centered (1 + w) norms, 0.0 for plain w
     iterations: u32, // sinkhorn iterations
     inter: u32,      // MLP intermediate size (swiglu)
-    _pad: u32,
+    x_stride: u32,   // branch_norm input row stride; 0 means the two-stream 2H
 }
 
 @group(0) @binding(0) var<uniform> step: Step;
@@ -49,7 +49,7 @@ fn reduce_sum(lid: u32, v: f32) -> f32 {
 @compute @workgroup_size(256)
 fn branch_norm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let m = wid.x + select(0u, step.m - 1u, p.last_row == 1u);
-    let base = m * 2u * p.h;
+    let base = m * select(2u * p.h, p.x_stride, p.x_stride != 0u);
     var pre0 = 1.0;
     var pre1 = 0.0;
     if (p.mode == 1u) {

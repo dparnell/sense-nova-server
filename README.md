@@ -25,6 +25,9 @@ the `openai` SDKs, ...) can use it.
   `reasoning_content`, image and video inputs), `/v1/completions`, `/v1/models`.
 * **Prefix caching** — multi-turn chats and agent loops reuse the already
   processed conversation instead of re-reading it every turn.
+* **Speculative decoding** — the model's own multi-token-prediction (MTP)
+  head drafts the next token and the main model verifies it in the same pass,
+  for about 1.5x faster generation with exactly the same output.
 
 ## Quick start
 
@@ -37,9 +40,10 @@ cargo build --release
 ```
 
 `pull` downloads the official weights (~38 GB) and quantizes them (Q8_0 by
-default, ~10 GB, plus a 0.5 GB `vision.snl` for the image encoder). If you
-pulled before vision support existed, run `pull` again: it skips what is
-already downloaded and converted and only adds the vision encoder. Use `--quant q4_0` for a ~7 GB file that
+default, ~10 GB, plus a 0.5 GB `vision.snl` for the image encoder and a
+0.3 GB `mtp.snl` for speculative decoding). If you pulled with an older
+version, run `pull` again: it skips what is already downloaded and converted
+and only adds what is missing. Use `--quant q4_0` for a ~7 GB file that
 fits smaller GPUs, and `--delete-source` to remove the 38 GB download afterwards.
 Set `HF_TOKEN` if you need authenticated downloads. Interrupted downloads resume.
 
@@ -164,6 +168,8 @@ Options shared by `run`, `serve` and `bench`:
 * `--ctx <tokens>` — context size; the KV cache is allocated up front (default 32768).
 * `--backend vulkan|dx12|metal|gl` and `--device <index>` — pick the GPU (see `devices`).
 * `--no-vision` — skip loading the vision encoder (saves ~0.5 GB of GPU memory).
+* `--no-mtp` — generate one token per step without speculative decoding
+  (saves ~0.5 GB of GPU memory).
 * `--max-image-pixels`, `--max-video-pixels`, `--max-video-frames` — media size limits.
 * Sampling defaults: `--temperature 1.0 --top-p 0.95 --top-k 20` (from the
   model's generation config); `--max-tokens 8192`.
@@ -177,10 +183,18 @@ on Linux, `~/Library/Application Support/sensenova-loop` on macOS), or wherever
 
 Measured on an RTX 5080 (16 GB, Vulkan, Windows 11):
 
-| Weights | File | Prompt processing | Generation |
-| --- | --- | --- | --- |
-| Q8_0 | 10.1 GB | ~380 tok/s | ~36 tok/s |
-| Q4_0 | 7.2 GB | ~420 tok/s | ~42 tok/s |
+| Weights | File | Prompt processing | Generation | Generation with MTP |
+| --- | --- | --- | --- | --- |
+| Q8_0 | 10.1 GB | ~380 tok/s | ~38 tok/s | ~55-60 tok/s |
+| Q4_0 | 7.2 GB | ~420 tok/s | ~45 tok/s | ~64 tok/s |
+
+With speculative decoding, the MTP head guesses the token after next; the main
+model checks the guess while producing the next token, in one pass that costs
+little more than a normal step. 75-95% of guesses are accepted in typical chat
+and code. Accepted guesses are kept with exactly the probability the model
+assigns them, so the output is distributed exactly as without MTP (and is
+identical with `temperature` 0). If drafting stops paying off, for example
+because GPU memory is full and the driver pages, it pauses itself.
 
 The vision encoder takes about 0.4 s for an 800x600 image (475 tokens) and
 about 1 s at the default 1 MP limit; reading the resulting image tokens into
@@ -189,8 +203,9 @@ the language model then runs at the prompt-processing speed above.
 Because the looped block runs twice, every token executes 56 decoder layers,
 so the model costs about as much per token as a ~14B dense model.
 
-GPU memory needed is roughly the weight file plus ~60 KB per context token
-(about 11.4 GB for Q8_0 at a 32K context). If generation is unexpectedly slow,
+GPU memory needed is roughly the weight file plus ~60 KB per context token,
+plus ~0.5 GB each for the vision encoder and the MTP head (about 12.5 GB for
+Q8_0 at a 32K context). If generation is unexpectedly slow,
 other applications may be holding GPU memory and forcing the driver to page
 (the dashboard's VRAM bar turns red when the card is full):
 lower `--ctx` or use `--quant q4_0`. On Windows, prefer the Vulkan backend
@@ -200,7 +215,6 @@ lower `--ctx` or use `--quant q4_0`. On Windows, prefer the Vulkan backend
 
 * Video files other than animated GIF/WebP need `ffmpeg` installed.
 * One request is processed at a time; concurrent requests are queued.
-* Multi-token prediction (MTP) speculative decoding is not used.
 
 ## How it works
 
@@ -213,5 +227,9 @@ with split-K decoding (`attention.wgsl`), and norms / mHC routing / SwiGLU
 (`layers.wgsl`). The vision tower (`src/vision.rs`, `vision.wgsl`) reuses the
 quantized matmuls and adds LayerNorm, 2D RoPE and bidirectional attention
 kernels; its output features replace the image placeholder tokens' embeddings,
-and `src/mm.rs` handles preprocessing and the M-RoPE positions. The chat
+and `src/mm.rs` handles preprocessing and the M-RoPE positions. The MTP head
+is one more decoder layer with its own KV cache, fed the main model's final
+hidden state and the next token's embedding. Verification runs two tokens
+through the main model; the linear-attention layers checkpoint their recurrent
+state after the first one so a rejected guess can be undone. The chat
 template is rendered with MiniJinja, exactly as shipped with the model.

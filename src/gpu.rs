@@ -153,14 +153,20 @@ impl Gpu {
     }
 
     pub fn map_read(&self, staging: &wgpu::Buffer) -> Result<Vec<f32>> {
+        self.map_read_n(staging, staging.size() as usize / 4)
+    }
+
+    /// Read the first `n` floats of a mappable buffer.
+    pub fn map_read_n(&self, staging: &wgpu::Buffer, n: usize) -> Result<Vec<f32>> {
+        let bytes = (n * 4) as u64;
         let (tx, rx) = std::sync::mpsc::channel();
-        staging.map_async(wgpu::MapMode::Read, .., move |r| {
+        staging.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
             let _ = tx.send(r);
         });
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow::anyhow!("GPU poll failed: {e}"))?;
         rx.recv()?.context("mapping GPU buffer")?;
         let out = {
-            let view = staging.get_mapped_range(..).context("reading mapped buffer")?;
+            let view = staging.get_mapped_range(..bytes).context("reading mapped buffer")?;
             bytemuck::cast_slice::<u8, f32>(&view).to_vec()
         };
         staging.unmap();
@@ -185,6 +191,8 @@ pub struct Kernel {
 pub enum MatKind {
     /// One row (decode).
     Vec1,
+    /// Two rows (speculative verification).
+    Vec2,
     /// Up to 8 rows.
     Vec,
     /// Tiled matmul for prefill.
@@ -192,18 +200,27 @@ pub enum MatKind {
 }
 
 impl MatKind {
+    /// Weight rows handled by one workgroup of the matrix-vector kernels.
+    pub fn rows_per_group(self) -> usize {
+        match self {
+            MatKind::Vec1 | MatKind::Vec2 => 32,
+            _ => 8,
+        }
+    }
+
     pub fn for_rows(m: usize) -> Self {
         match m {
             1 => MatKind::Vec1,
-            2..=8 => MatKind::Vec,
+            2 => MatKind::Vec2,
+            3..=8 => MatKind::Vec,
             _ => MatKind::Tiled,
         }
     }
 }
 
 pub struct Kernels {
-    /// [q8_0, q4_0] x [Vec1, Vec, Tiled]; all share one bind group layout.
-    pub mat: [[Kernel; 3]; 2],
+    /// [q8_0, q4_0] x [Vec1, Vec2, Vec, Tiled]; all share one bind group layout.
+    pub mat: [[Kernel; 4]; 2],
     pub branch_norm: Kernel,
     pub mhc_dots: Kernel,
     pub mhc_finish: Kernel,
@@ -226,6 +243,25 @@ fn block_dot(wbase: u32, xbase: u32) -> f32 {
          + dot(i8x4(b.x), x[xbase + 4u]) + dot(i8x4(b.y), x[xbase + 5u])
          + dot(i8x4(b.z), x[xbase + 6u]) + dot(i8x4(b.w), x[xbase + 7u]);
 }
+// One block against x values already loaded into registers.
+fn block_dot_v(wbase: u32, xv: ptr<function, array<vec4<f32>, 8>>) -> f32 {
+    let a = wq[wbase];
+    let b = wq[wbase + 1u];
+    return dot(i8x4(a.x), (*xv)[0]) + dot(i8x4(a.y), (*xv)[1]) + dot(i8x4(a.z), (*xv)[2]) + dot(i8x4(a.w), (*xv)[3])
+         + dot(i8x4(b.x), (*xv)[4]) + dot(i8x4(b.y), (*xv)[5]) + dot(i8x4(b.z), (*xv)[6]) + dot(i8x4(b.w), (*xv)[7]);
+}
+// The same block against two x rows, unpacking the weights once.
+fn block_dot2(wbase: u32, xa: u32, xb: u32) -> vec2<f32> {
+    let a = wq[wbase];
+    let b = wq[wbase + 1u];
+    let w0 = i8x4(a.x); let w1 = i8x4(a.y); let w2 = i8x4(a.z); let w3 = i8x4(a.w);
+    let w4 = i8x4(b.x); let w5 = i8x4(b.y); let w6 = i8x4(b.z); let w7 = i8x4(b.w);
+    return vec2<f32>(
+        dot(w0, x[xa]) + dot(w1, x[xa + 1u]) + dot(w2, x[xa + 2u]) + dot(w3, x[xa + 3u])
+            + dot(w4, x[xa + 4u]) + dot(w5, x[xa + 5u]) + dot(w6, x[xa + 6u]) + dot(w7, x[xa + 7u]),
+        dot(w0, x[xb]) + dot(w1, x[xb + 1u]) + dot(w2, x[xb + 2u]) + dot(w3, x[xb + 3u])
+            + dot(w4, x[xb + 4u]) + dot(w5, x[xb + 5u]) + dot(w6, x[xb + 6u]) + dot(w7, x[xb + 7u]));
+}
 fn dequant8(wbase: u32, part: u32, scale: f32) -> array<f32, 8> {
     let v = wq[wbase + part / 2u];
     var w0 = v.x;
@@ -245,6 +281,23 @@ fn block_dot(wbase: u32, xbase: u32) -> f32 {
          + dot(u4x4(v.y, 0u), x[xbase + 2u]) + dot(u4x4(v.y, 16u), x[xbase + 3u])
          + dot(u4x4(v.z, 0u), x[xbase + 4u]) + dot(u4x4(v.z, 16u), x[xbase + 5u])
          + dot(u4x4(v.w, 0u), x[xbase + 6u]) + dot(u4x4(v.w, 16u), x[xbase + 7u]);
+}
+fn block_dot_v(wbase: u32, xv: ptr<function, array<vec4<f32>, 8>>) -> f32 {
+    let v = wq[wbase];
+    return dot(u4x4(v.x, 0u), (*xv)[0]) + dot(u4x4(v.x, 16u), (*xv)[1])
+         + dot(u4x4(v.y, 0u), (*xv)[2]) + dot(u4x4(v.y, 16u), (*xv)[3])
+         + dot(u4x4(v.z, 0u), (*xv)[4]) + dot(u4x4(v.z, 16u), (*xv)[5])
+         + dot(u4x4(v.w, 0u), (*xv)[6]) + dot(u4x4(v.w, 16u), (*xv)[7]);
+}
+fn block_dot2(wbase: u32, xa: u32, xb: u32) -> vec2<f32> {
+    let v = wq[wbase];
+    let w0 = u4x4(v.x, 0u); let w1 = u4x4(v.x, 16u); let w2 = u4x4(v.y, 0u); let w3 = u4x4(v.y, 16u);
+    let w4 = u4x4(v.z, 0u); let w5 = u4x4(v.z, 16u); let w6 = u4x4(v.w, 0u); let w7 = u4x4(v.w, 16u);
+    return vec2<f32>(
+        dot(w0, x[xa]) + dot(w1, x[xa + 1u]) + dot(w2, x[xa + 2u]) + dot(w3, x[xa + 3u])
+            + dot(w4, x[xa + 4u]) + dot(w5, x[xa + 5u]) + dot(w6, x[xa + 6u]) + dot(w7, x[xa + 7u]),
+        dot(w0, x[xb]) + dot(w1, x[xb + 1u]) + dot(w2, x[xb + 2u]) + dot(w3, x[xb + 3u])
+            + dot(w4, x[xb + 4u]) + dot(w5, x[xb + 5u]) + dot(w6, x[xb + 6u]) + dot(w7, x[xb + 7u]));
 }
 fn dequant8(wbase: u32, part: u32, scale: f32) -> array<f32, 8> {
     let w = wq[wbase][part];
@@ -320,8 +373,10 @@ impl Kernels {
         let attn = module("attention", include_str!("shaders/attention.wgsl").into());
         let at = layout("attention", &[Uniform, Uniform, ReadWrite, ReadWrite, ReadWrite, ReadWrite, Read, ReadWrite, ReadWrite, Read]);
         let lin = module("linear", include_str!("shaders/linear.wgsl").into());
-        let li = layout("linear", &[Uniform, Uniform, ReadWrite, ReadWrite, ReadWrite, ReadWrite, Read, ReadWrite]);
-        let mats = |m: &wgpu::ShaderModule| [kernel(m, "matvec1", &mm), kernel(m, "matvec", &mm), kernel(m, "matmul", &mm)];
+        let li = layout("linear", &[Uniform, Uniform, ReadWrite, ReadWrite, ReadWrite, ReadWrite, Read, ReadWrite, ReadWrite, ReadWrite]);
+        let mats = |m: &wgpu::ShaderModule| {
+            [kernel(m, "matvec1", &mm), kernel(m, "matvec2", &mm), kernel(m, "matvec", &mm), kernel(m, "matmul", &mm)]
+        };
 
         Ok(Kernels {
             mat: [mats(&q8), mats(&q4)],

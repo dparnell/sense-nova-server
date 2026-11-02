@@ -392,6 +392,12 @@ impl App {
         if t.errors > 0 {
             req.push(Span::styled(format!("   {} failed", t.errors), Style::new().fg(Color::Red).bold()));
         }
+        if t.drafted > 0 {
+            req.push(Span::styled(
+                format!("   MTP {:.0}% accepted", t.accepted as f64 / t.drafted as f64 * 100.0),
+                Style::new().fg(GEN),
+            ));
+        }
         f.render_widget(Paragraph::new(Line::from(req)), rows[3]);
         let tokens = Line::from(vec![
             Span::styled(format!("{:<9}", "Tokens"), Style::new().fg(DIM)),

@@ -374,7 +374,7 @@ fn mat_ops<'a>(
         ]);
         let groups = match kind {
             MatKind::Tiled => (wrows.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1),
-            _ => split(wrows.div_ceil(8) as u32),
+            _ => split(wrows.div_ceil(kind.rows_per_group()) as u32),
         };
         ops.push(Dispatch { name: "matmul", kernel, bg, groups });
     }

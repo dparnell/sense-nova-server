@@ -198,8 +198,13 @@ pub fn run(
                     }
                     println!();
                     if opts.stats {
+                        let spec = if f.drafted > 0 {
+                            format!(", {:.0}% of drafts accepted", f.accepted as f64 / f.drafted as f64 * 100.0)
+                        } else {
+                            String::new()
+                        };
                         eprintln!(
-                            "{DIM}[prompt {} tok, {} cached, {:.0} tok/s | {} tok at {:.1} tok/s]{RESET}",
+                            "{DIM}[prompt {} tok, {} cached, {:.0} tok/s | {} tok at {:.1} tok/s{spec}]{RESET}",
                             f.prompt_tokens,
                             f.cached_tokens,
                             (f.prompt_tokens - f.cached_tokens) as f64 / f.prefill_secs.max(1e-9),

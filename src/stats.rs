@@ -71,6 +71,9 @@ pub struct Totals {
     pub cached_tokens: u64,
     pub generated_tokens: u64,
     pub busy_secs: f64,
+    /// Speculative decoding: drafted and accepted tokens.
+    pub drafted: u64,
+    pub accepted: u64,
 }
 
 #[derive(Clone, Default)]
@@ -164,16 +167,16 @@ impl Stats {
         }
     }
 
-    /// One decode step finished; `generated` counts sampled tokens so far.
-    pub fn decoded(&self, generated: usize, max: usize, secs: f64, pos: usize) {
+    /// One decode step produced `tokens` tokens; `generated` counts sampled tokens so far.
+    pub fn decoded(&self, generated: usize, max: usize, tokens: usize, secs: f64, pos: usize) {
         let mut s = self.inner.lock().unwrap();
         self.bucket(&mut s, |b| {
-            b.decode_tokens += 1;
+            b.decode_tokens += tokens;
             b.decode_secs += secs;
         });
         s.context_used = pos;
         if let Some(c) = &mut s.current {
-            let r = 1.0 / secs.max(1e-6);
+            let r = tokens as f64 / secs.max(1e-6);
             c.rate = if c.rate == 0.0 { r } else { 0.9 * c.rate + 0.1 * r };
             c.phase = Phase::Decode { generated, max };
         }
@@ -184,8 +187,13 @@ impl Stats {
         let pp = new as f64 / f.prefill_secs.max(1e-9);
         let tg = f.completion_tokens as f64 / f.decode_secs.max(1e-9);
         if self.output == Output::Print {
+            let spec = if f.drafted > 0 {
+                format!(", {:.0}% of drafts accepted", f.accepted as f64 / f.drafted as f64 * 100.0)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "request: prompt {} tok ({} cached, {pp:.0} tok/s), generated {} tok ({tg:.1} tok/s)",
+                "request: prompt {} tok ({} cached, {pp:.0} tok/s), generated {} tok ({tg:.1} tok/s{spec})",
                 f.prompt_tokens, f.cached_tokens, f.completion_tokens,
             );
         }
@@ -197,6 +205,8 @@ impl Stats {
         t.cached_tokens += f.cached_tokens as u64;
         t.generated_tokens += f.completion_tokens as u64;
         t.busy_secs += f.prefill_secs + f.decode_secs;
+        t.drafted += f.drafted as u64;
+        t.accepted += f.accepted as u64;
         let outcome = match (f.reason, f.cancelled) {
             (_, true) => "cancelled",
             (FinishReason::Stop, _) => "stop",
