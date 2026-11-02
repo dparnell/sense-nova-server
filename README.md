@@ -11,9 +11,7 @@ the `openai` SDKs, ...) can use it.
   llama.cpp fork needed.
 * **Any GPU, any desktop OS** — runs on [wgpu](https://wgpu.rs): Vulkan on
   Windows/Linux (NVIDIA, AMD, Intel), Metal on macOS (Apple Silicon and AMD),
-  DirectX 12 as a fallback. So far tested on Windows 11 with an NVIDIA RTX 5080
-  (Vulkan and DX12) and an AMD Radeon integrated GPU (Vulkan); Linux and macOS
-  builds use the same portable code but have not been run yet.
+  DirectX 12 as a fallback. See [Status](#status) for what has been tested.
 * **Faithful to the architecture** — Gated DeltaNet linear attention, gated
   full attention with partial RoPE, the looped middle block (layers 4–27 run
   twice with shared weights) and the 2-stream mHC hyper-connections with
@@ -28,6 +26,36 @@ the `openai` SDKs, ...) can use it.
 * **Speculative decoding** — the model's own multi-token-prediction (MTP)
   head drafts the next token and the main model verifies it in the same pass,
   for about 1.5x faster generation with exactly the same output.
+* **Live dashboard** — `serve` shows throughput charts, GPU load, VRAM,
+  temperature and recent requests in the terminal.
+
+## Status
+
+Everything listed above is implemented and has been checked on Windows 11
+with an NVIDIA RTX 5080 (Vulkan):
+
+| Part | How it was checked |
+| --- | --- |
+| Text model | Next-token logits match a PyTorch FP32 reference built from `transformers`' Qwen3.5 layers (within 8-bit quantization error); batched and token-by-token runs agree |
+| Vision encoder | Features match `transformers`' `Qwen3_5VisionModel` (cosine similarity 0.9997); preprocessing matches the official image processor; M-RoPE positions match `get_rope_index` exactly; logits for an image prompt match the reference |
+| Video | Animated GIF, frame lists and MP4 (via ffmpeg) answered correctly, including timestamps |
+| MTP | Greedy output is byte-identical with and without speculative decoding, across multi-turn chats with images and tool calls |
+| OpenAI API | Official `openai` Python SDK: streaming, tool calls and tool round trips, images, videos, prefix caching, error handling |
+
+The text model has also run correctly on an AMD Radeon integrated GPU
+(Vulkan) and on DirectX 12. Linux and macOS use the same portable code but
+have not been tested yet, nor have the vision encoder and MTP on non-NVIDIA
+GPUs.
+
+## Requirements
+
+* Rust 1.88 or newer (`rustup update`).
+* A GPU with Vulkan (Windows, Linux), Metal (macOS) or DirectX 12 (Windows)
+  drivers, and enough memory for the model: about 12.5 GB for Q8_0 or 9.5 GB
+  for Q4_0 at the default 32K context, less with a smaller `--ctx`.
+* About 50 GB of free disk space for `pull` (the 38 GB download can be
+  deleted after conversion with `--delete-source`).
+* Optional: `ffmpeg` and `ffprobe` on your PATH for MP4/WebM/MOV video input.
 
 ## Quick start
 
@@ -77,8 +105,9 @@ attach media to your next message.
 In a terminal, `serve` shows a live dashboard: what the model is doing right
 now (reading the prompt or generating, with progress and context use), charts
 of generation and prompt-processing speed, GPU load and VRAM use over time,
-GPU temperature and power, the process's CPU and RAM, request totals and a
-table of recent requests with their speed and outcome. Press `q` (or Ctrl+C)
+GPU temperature and power, the process's CPU and RAM, request totals
+(including the share of MTP drafts accepted) and a table of recent requests
+with their speed and outcome. Press `q` (or Ctrl+C)
 to stop the server. GPU load, VRAM, temperature and power come from NVIDIA's
 NVML; on other GPUs the chart shows how busy the engine kept the GPU instead.
 Use `--no-tui` (or redirect the output) for plain one-line-per-request logs.
@@ -154,12 +183,12 @@ fed back through the model's chat template.
 
 | Command | Purpose |
 | --- | --- |
-| `pull [REPO] [--quant q8_0\|q4_0] [--delete-source]` | Download and quantize a model |
+| `pull [REPO] [--quant q8_0\|q4_0] [--delete-source]` | Download and quantize a model (plus its vision encoder and MTP head) |
 | `convert <DIR> [--quant ...]` | Quantize an already-downloaded Hugging Face checkpoint |
-| `run [-p PROMPT] [--system TEXT] [--hide-reasoning] [--stats]` | Terminal chat (`/think`, `/nothink`, `/reset`, `/system`, `/exit`) |
-| `serve [--host] [--port] [--api-key] [--served-model-name] [--inline-reasoning] [--no-tui]` | OpenAI-compatible server with a live dashboard |
+| `run [-p PROMPT] [--image PATH] [--video PATH] [--system TEXT] [--hide-reasoning] [--stats]` | Terminal chat (`/image`, `/video`, `/think`, `/nothink`, `/reset`, `/system`, `/exit`) |
+| `serve [--host] [--port] [--api-key] [--served-model-name] [--inline-reasoning] [--no-tui] [--allow-local-media]` | OpenAI-compatible server with a live dashboard |
 | `devices` | List usable GPUs |
-| `bench` | Measure prompt processing and generation speed |
+| `bench` | Measure prompt processing, generation and speculative step speed |
 
 Options shared by `run`, `serve` and `bench`:
 
@@ -170,7 +199,8 @@ Options shared by `run`, `serve` and `bench`:
 * `--no-vision` — skip loading the vision encoder (saves ~0.5 GB of GPU memory).
 * `--no-mtp` — generate one token per step without speculative decoding
   (saves ~0.5 GB of GPU memory).
-* `--max-image-pixels`, `--max-video-pixels`, `--max-video-frames` — media size limits.
+* `--max-image-pixels`, `--max-video-pixels`, `--max-video-frames` — media
+  size limits (`run` and `serve`).
 * Sampling defaults: `--temperature 1.0 --top-p 0.95 --top-k 20` (from the
   model's generation config); `--max-tokens 8192`.
 
@@ -205,16 +235,24 @@ so the model costs about as much per token as a ~14B dense model.
 
 GPU memory needed is roughly the weight file plus ~60 KB per context token,
 plus ~0.5 GB each for the vision encoder and the MTP head (about 12.5 GB for
-Q8_0 at a 32K context). If generation is unexpectedly slow,
-other applications may be holding GPU memory and forcing the driver to page
-(the dashboard's VRAM bar turns red when the card is full):
-lower `--ctx` or use `--quant q4_0`. On Windows, prefer the Vulkan backend
-(the default); DX12 works but compiles shaders slowly and runs slower.
+Q8_0 at a 32K context). Other applications share the GPU: browsers, chat
+apps and remote-desktop tools can hold several GB between them. When the total
+doesn't fit, the driver pages part of the model to system RAM and generation
+slows down noticeably (the dashboard's VRAM bar turns red when the card is
+full). On a 16 GB card with other apps open, use a smaller `--ctx` (8192 is
+plenty for most chats), `--quant q4_0`, or turn off features you don't need
+with `--no-vision` / `--no-mtp`. On Windows, prefer the Vulkan backend (the default);
+DX12 works but compiles shaders slowly and runs slower.
 
 ## Limitations
 
-* Video files other than animated GIF/WebP need `ffmpeg` installed.
 * One request is processed at a time; concurrent requests are queued.
+* MTP drafts one token per step (the model ships a single MTP layer).
+* Not yet implemented in the API: structured output (`response_format` with a
+  JSON schema), `logprobs`, and the `/v1/responses` endpoint.
+* The vision encoder is not yet tuned for speed (about 1 s per 1 MP image).
+* Video files other than animated GIF/WebP need `ffmpeg` installed.
+* Linux and macOS are untested (see [Status](#status)).
 
 ## How it works
 
