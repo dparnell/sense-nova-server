@@ -64,7 +64,7 @@ struct AttnP {
     rope_theta: f32,
     eps: f32,
     scale: f32,
-    _pad: u32,
+    mrope: u32,
 }
 
 #[repr(C)]
@@ -79,10 +79,34 @@ struct LinP {
 }
 
 /// A quantized matrix on the GPU, split into row chunks that fit one binding.
-struct QWeight {
-    dtype: DType,
-    k: usize,
-    chunks: Vec<(wgpu::Buffer, wgpu::Buffer, usize, usize)>, // (quants, scales, rows, first row)
+pub(crate) struct QWeight {
+    pub dtype: DType,
+    pub k: usize,
+    pub chunks: Vec<(wgpu::Buffer, wgpu::Buffer, usize, usize)>, // (quants, scales, rows, first row)
+}
+
+pub(crate) fn upload_q(gpu: &Gpu, wf: &WeightFile, name: &str) -> Result<QWeight> {
+    let info = wf.info(name)?;
+    let (q, s) = wf.bytes(name)?;
+    let (rows, k) = (info.rows(), info.cols());
+    let row_q = q.len() / rows;
+    let row_s = s.len() / rows;
+    let per = ((gpu.max_binding() as usize / row_q.max(1)) / 64 * 64).max(64).min(rows);
+    let mut chunks = Vec::new();
+    let mut r0 = 0;
+    while r0 < rows {
+        let n = per.min(rows - r0);
+        let qb = gpu.storage_init(name, &q[r0 * row_q..(r0 + n) * row_q]);
+        let sb = gpu.storage_init(name, &s[r0 * row_s..(r0 + n) * row_s]);
+        chunks.push((qb, sb, n, r0));
+        r0 += n;
+    }
+    Ok(QWeight { dtype: info.dtype, k, chunks })
+}
+
+pub(crate) fn upload_f(gpu: &Gpu, wf: &WeightFile, name: &str) -> Result<wgpu::Buffer> {
+    let (q, _) = wf.bytes(name)?;
+    Ok(gpu.storage_init(name, q))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +143,7 @@ pub struct Engine {
     weights: Arc<WeightFile>,
     step: wgpu::Buffer,
     x: wgpu::Buffer,
+    rpos: wgpu::Buffer,
     logits: wgpu::Buffer,
     staging: wgpu::Buffer,
     lin_state: wgpu::Buffer,
@@ -135,6 +160,7 @@ pub struct Engine {
     slow_gpu: bool,
     profile: Option<std::cell::RefCell<std::collections::HashMap<String, (f64, usize)>>>,
     _keep: Vec<wgpu::Buffer>,
+    pub vision: Option<crate::vision::Vision>,
 }
 
 fn op_label(op: &Op) -> String {
@@ -154,7 +180,7 @@ fn align256(x: u64) -> u64 {
 }
 
 impl Engine {
-    pub fn load(gpu: Gpu, path: &Path, ctx: usize) -> Result<Self> {
+    pub fn load(gpu: Gpu, path: &Path, ctx: usize, vision: Option<&Path>) -> Result<Self> {
         let wf = Arc::new(WeightFile::open(path)?);
         let cfg = wf.header.config.clone();
         let kernels = Kernels::new(&gpu)?;
@@ -164,28 +190,8 @@ impl Engine {
 
         // ---- weights ----
         let max_bind = gpu.max_binding();
-        let upload_q = |name: &str| -> Result<QWeight> {
-            let info = wf.info(name)?;
-            let (q, s) = wf.bytes(name)?;
-            let (rows, k) = (info.rows(), info.cols());
-            let row_q = q.len() / rows;
-            let row_s = s.len() / rows;
-            let per = ((max_bind as usize / row_q.max(1)) / 64 * 64).max(64).min(rows);
-            let mut chunks = Vec::new();
-            let mut r0 = 0;
-            while r0 < rows {
-                let n = per.min(rows - r0);
-                let qb = gpu.storage_init(name, &q[r0 * row_q..(r0 + n) * row_q]);
-                let sb = gpu.storage_init(name, &s[r0 * row_s..(r0 + n) * row_s]);
-                chunks.push((qb, sb, n, r0));
-                r0 += n;
-            }
-            Ok(QWeight { dtype: info.dtype, k, chunks })
-        };
-        let upload_f = |name: &str| -> Result<wgpu::Buffer> {
-            let (q, _) = wf.bytes(name)?;
-            Ok(gpu.storage_init(name, q))
-        };
+        let upload_q = |name: &str| upload_q(&gpu, &wf, name);
+        let upload_f = |name: &str| upload_f(&gpu, &wf, name);
 
         // ---- activations ----
         let proj_w = (2 * cfg.intermediate).max(cfg.lin_proj_rows()).max(cfg.attn_proj_rows());
@@ -207,6 +213,7 @@ impl Engine {
         let qbuf = gpu.storage("qbuf", f(MAX_M * cfg.q_dim()));
         let coef = gpu.storage("coef", f(MAX_M * 8));
         let partial = gpu.storage("partial", f(cfg.n_heads * MAX_M * (cfg.head_dim + 2)));
+        let rpos = gpu.storage("rope_pos", (MAX_M * 16) as u64);
         let logits = gpu.storage("logits", f(cfg.vocab));
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("logits staging"),
@@ -348,13 +355,14 @@ impl Engine {
                         rope_theta: cfg.rope_theta,
                         eps: cfg.eps,
                         scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-                        _pad: 0,
+                        mrope: ((3 * cfg.mrope_section[1]) << 16 | (3 * cfg.mrope_section[2])) as u32,
                     },
                 );
                 let res = |kern: &Kernel| {
                     bind_group(&gpu, kern, "attn", &[
                         Res::Whole(&step), Res::Whole(&ap), Res::Whole(&proj), Res::Whole(&qbuf), Res::Whole(&kc),
                         Res::Whole(&vc), Res::Whole(&l.small), Res::Whole(&attn_out), Res::Whole(&partial),
+                        Res::Whole(&rpos),
                     ])
                 };
                 ops.push(Op::AttnPrep { bg: res(&k.attn_prep), slots: (cfg.n_heads + 2 * cfg.n_kv_heads) as u32 });
@@ -446,6 +454,7 @@ impl Engine {
             },
             step,
             x,
+            rpos,
             logits,
             staging,
             lin_state,
@@ -459,9 +468,19 @@ impl Engine {
             slow_gpu: slow,
             profile: std::env::var_os("SENSENOVA_PROFILE").map(|_| Default::default()),
             _keep: keep,
+            vision: None,
         };
+        if let Some(vp) = vision {
+            engine.vision = Some(crate::vision::Vision::load(&engine.gpu, vp)?);
+        }
         engine.reset();
         Ok(engine)
+    }
+
+    /// Run the vision tower on an image or video: `tokens()` rows of `hidden` floats.
+    pub fn encode_media(&self, m: &crate::mm::Media) -> Result<Vec<f32>> {
+        let Some(v) = &self.vision else { bail!("this model was loaded without its vision encoder") };
+        v.encode(&self.gpu, &self.kernels, &m.patches, m.frames, m.h, m.w, self.slow_gpu)
     }
 
     /// Clear all recurrent state; the KV caches are simply overwritten from position 0.
@@ -508,10 +527,27 @@ impl Engine {
         Ok(out)
     }
 
-    /// Feed `tokens` at the current position. Returns logits for the last token when asked.
+    /// Feed text `tokens` at the current position, with rotary positions equal to
+    /// cache positions. Returns logits for the last token when asked.
     pub fn forward(&mut self, tokens: &[u32], want_logits: bool) -> Result<Option<Vec<f32>>> {
+        self.forward_mm(tokens, None, &[], want_logits)
+    }
+
+    /// Feed `tokens` at the current cache position. `pos` gives each token's
+    /// rotary (t, h, w) position (default: its cache position), and `embeds`
+    /// replaces the embedding of token `i` with a row of `hidden` floats.
+    pub fn forward_mm(
+        &mut self,
+        tokens: &[u32],
+        pos: Option<&[[u32; 3]]>,
+        embeds: &[(usize, &[f32])],
+        want_logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
         if tokens.is_empty() {
             bail!("forward called with no tokens");
+        }
+        if pos.is_some_and(|p| p.len() != tokens.len()) || embeds.iter().any(|(i, r)| *i >= tokens.len() || r.len() != self.cfg.hidden) {
+            bail!("forward: positions or embeddings do not match the tokens");
         }
         if self.pos + tokens.len() > self.ctx {
             bail!("context length exceeded ({} > {})", self.pos + tokens.len(), self.ctx);
@@ -529,8 +565,20 @@ impl Engine {
                 _pad: 0,
             }));
             let t_start = std::time::Instant::now();
-            let emb = self.embed(chunk)?;
+            let c0 = ci * self.prefill_chunk;
+            let mut emb = self.embed(chunk)?;
+            let h = self.cfg.hidden;
+            for (i, row) in embeds.iter().filter(|(i, _)| (c0..c0 + m).contains(i)) {
+                emb[(i - c0) * 2 * h..(i - c0) * 2 * h + h].copy_from_slice(row);
+            }
             self.gpu.queue.write_buffer(&self.x, 0, bytemuck::cast_slice(&emb));
+            let rp: Vec<[u32; 4]> = (0..m)
+                .map(|i| match pos {
+                    Some(p) => [p[c0 + i][0], p[c0 + i][1], p[c0 + i][2], 0],
+                    None => [(self.pos + i) as u32; 4],
+                })
+                .collect();
+            self.gpu.queue.write_buffer(&self.rpos, 0, bytemuck::cast_slice(&rp));
 
             if let Some(prof) = &self.profile {
                 // Profiling: run each op on its own and wait for it.

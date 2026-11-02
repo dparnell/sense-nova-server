@@ -114,6 +114,15 @@ enum Source {
     Concat(Vec<String>),
     /// mHC router: weight [8, 2H] followed by bias [8].
     WeightBias(String, String),
+    /// A [rows, cols] (or [rows]) tensor zero-padded to the planned shape.
+    Pad(String),
+}
+
+/// Which part of the checkpoint to convert.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Text,
+    Vision,
 }
 
 struct Planned {
@@ -142,6 +151,46 @@ fn vector(out: &mut Vec<Planned>, st: &Safetensors, name: String, parts: Vec<Str
     }
     out.push(Planned { name, dtype: DType::F32, shape: vec![len], source: Source::Concat(parts) });
     Ok(())
+}
+
+/// The vision tower and patch merger. Matrices stay at 8 bits; the MLP width is
+/// zero-padded to a multiple of the quantization block (padded units contribute nothing).
+fn plan_vision(cfg: &ModelConfig, st: &Safetensors) -> Result<Vec<Planned>> {
+    let v = cfg.vision.as_ref().context("config.json has no vision_config")?;
+    let p = "model.visual";
+    let mut out = Vec::new();
+    let o = &mut out;
+    let q8 = DType::Q8_0;
+    let pad = |name: String, src: String, shape: Vec<usize>| Planned {
+        name,
+        dtype: if shape.len() == 2 { q8 } else { DType::F32 },
+        shape,
+        source: Source::Pad(src),
+    };
+    // Conv3d weight [hidden, 3, 2, 16, 16] is a matrix over flattened (c, t, y, x) patches.
+    o.push(pad("v.patch".into(), format!("{p}.patch_embed.proj.weight"), vec![v.hidden, v.patch_dim()]));
+    vector(o, st, "v.patch_b".into(), vec![format!("{p}.patch_embed.proj.bias")])?;
+    vector(o, st, "v.pos".into(), vec![format!("{p}.pos_embed.weight")])?;
+    for i in 0..v.depth {
+        let b = format!("{p}.blocks.{i}");
+        vector(o, st, format!("v{i}.n1"), vec![format!("{b}.norm1.weight"), format!("{b}.norm1.bias")])?;
+        vector(o, st, format!("v{i}.n2"), vec![format!("{b}.norm2.weight"), format!("{b}.norm2.bias")])?;
+        matrix(o, st, format!("v{i}.qkv"), q8, vec![format!("{b}.attn.qkv.weight")])?;
+        vector(o, st, format!("v{i}.qkv_b"), vec![format!("{b}.attn.qkv.bias")])?;
+        matrix(o, st, format!("v{i}.proj"), q8, vec![format!("{b}.attn.proj.weight")])?;
+        vector(o, st, format!("v{i}.proj_b"), vec![format!("{b}.attn.proj.bias")])?;
+        o.push(pad(format!("v{i}.fc1"), format!("{b}.mlp.linear_fc1.weight"), vec![v.intermediate_padded, v.hidden]));
+        o.push(pad(format!("v{i}.fc1_b"), format!("{b}.mlp.linear_fc1.bias"), vec![v.intermediate_padded]));
+        o.push(pad(format!("v{i}.fc2"), format!("{b}.mlp.linear_fc2.weight"), vec![v.hidden, v.intermediate_padded]));
+        vector(o, st, format!("v{i}.fc2_b"), vec![format!("{b}.mlp.linear_fc2.bias")])?;
+    }
+    let m = format!("{p}.merger");
+    vector(o, st, "vm.norm".into(), vec![format!("{m}.norm.weight"), format!("{m}.norm.bias")])?;
+    matrix(o, st, "vm.fc1".into(), q8, vec![format!("{m}.linear_fc1.weight")])?;
+    vector(o, st, "vm.fc1_b".into(), vec![format!("{m}.linear_fc1.bias")])?;
+    matrix(o, st, "vm.fc2".into(), q8, vec![format!("{m}.linear_fc2.weight")])?;
+    vector(o, st, "vm.fc2_b".into(), vec![format!("{m}.linear_fc2.bias")])?;
+    Ok(out)
 }
 
 fn plan(cfg: &ModelConfig, st: &Safetensors, quant: DType) -> Result<Vec<Planned>> {
@@ -233,15 +282,19 @@ fn align(x: u64) -> u64 {
     x.div_ceil(ALIGN) * ALIGN
 }
 
-/// Convert the checkpoint in `src` (HF layout) into `dst`.
-pub fn convert(src: &Path, dst: &Path, quant: DType, model_name: &str) -> Result<()> {
+/// Convert one part of the checkpoint in `src` (HF layout) into `dst`.
+pub fn convert(src: &Path, dst: &Path, quant: DType, model_name: &str, part: Part) -> Result<()> {
     let config: Value = serde_json::from_slice(&std::fs::read(src.join("config.json"))?)?;
     let generation: Option<Value> = std::fs::read(src.join("generation_config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
     let cfg = ModelConfig::from_hf(&config, generation.as_ref())?;
     let st = Safetensors::open(src)?;
-    let planned = plan(&cfg, &st, quant)?;
+    let planned = match part {
+        Part::Text => plan(&cfg, &st, quant)?,
+        Part::Vision => plan_vision(&cfg, &st)?,
+    };
+    let quant = if part == Part::Vision { DType::Q8_0 } else { quant };
 
     // Lay out every tensor before writing so the header can be written first.
     let mut tensors = BTreeMap::new();
@@ -287,6 +340,21 @@ pub fn convert(src: &Path, dst: &Path, quant: DType, model_name: &str) -> Result
             Source::WeightBias(wn, bn) => {
                 let mut v = st.read(wn)?;
                 v.extend(st.read(bn)?);
+                v
+            }
+            Source::Pad(name) => {
+                let src = st.read(name)?;
+                let src_shape = st.shape(name)?;
+                let src_cols = if src_shape.len() == 1 { src_shape[0] } else { src_shape[1..].iter().product() };
+                let src_rows = src.len() / src_cols;
+                let (rows, cols) = (info.rows(), info.cols());
+                if src_rows > rows || src_cols > cols {
+                    bail!("{}: source tensor is larger than the planned shape", t.name);
+                }
+                let mut v = vec![0f32; rows * cols];
+                for r in 0..src_rows {
+                    v[r * cols..r * cols + src_cols].copy_from_slice(&src[r * src_cols..(r + 1) * src_cols]);
+                }
                 v
             }
         };

@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::chat::{ChatTemplate, OutputParser, Piece, Tokenizer, ToolCall};
+use crate::config::VisionConfig;
+use crate::mm::{self, Limits, Prompt};
 use crate::sampler::SamplingParams;
 use crate::stats::Stats;
 use crate::worker::{Finish, FinishReason, GenEvent, GenRequest};
@@ -39,6 +41,9 @@ pub struct AppState {
     pub im_start: Option<u32>,
     pub ctx: usize,
     pub stats: Arc<Stats>,
+    /// Present when the vision encoder is loaded.
+    pub vision: Option<VisionConfig>,
+    pub limits: Limits,
 }
 
 type Shared = Arc<AppState>;
@@ -161,7 +166,7 @@ fn finish_reason(f: &Finish, tool_calls: bool) -> &'static str {
     }
 }
 
-fn submit(st: &AppState, prompt: Vec<u32>, snapshot_at: Option<usize>, c: &Common) -> UnboundedReceiver<GenEvent> {
+fn submit(st: &AppState, prompt: Prompt, snapshot_at: Option<usize>, c: &Common) -> UnboundedReceiver<GenEvent> {
     let (tx, rx) = unbounded_channel();
     let req = GenRequest {
         prompt,
@@ -216,33 +221,47 @@ async fn chat_completions(State(st): State<Shared>, Json(b): Json<Value>) -> Res
     let Some(messages) = b.get("messages").and_then(Value::as_array) else {
         return bad_request("`messages` is required");
     };
-    for m in messages {
-        if let Some(parts) = m.get("content").and_then(Value::as_array) {
-            if parts.iter().any(|p| p.get("type").and_then(Value::as_str).is_some_and(|t| t != "text")) {
-                return bad_request("only text content is supported; image and video inputs are not implemented yet");
-            }
+    let (messages, refs) = match mm::extract_media(messages) {
+        Ok(x) => x,
+        Err(e) => return bad_request(format!("{e:#}")),
+    };
+    let media = if refs.is_empty() {
+        Vec::new()
+    } else {
+        if st.vision.is_none() {
+            return bad_request("image and video inputs need the vision encoder, which is not loaded (run `sensenova-loop pull` to add it, and do not pass --no-vision)");
         }
-    }
+        let limits = st.limits;
+        match tokio::task::spawn_blocking(move || mm::load_media(&refs, &limits)).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return bad_request(format!("{e:#}")),
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "server_error"),
+        }
+    };
     let tools = match b.get("tools") {
         Some(Value::Array(t)) if !t.is_empty() && b["tool_choice"].as_str() != Some("none") => Some(Value::Array(t.clone())),
         _ => None,
     };
     let thinking = thinking_enabled(&st, &b);
-    let prompt = match st.template.render(messages, tools.as_ref(), thinking) {
+    let text = match st.template.render(&messages, tools.as_ref(), thinking) {
         Ok(p) => p,
         Err(e) => return bad_request(format!("{e:#}")),
     };
-    let tokens = match st.tok.encode(&prompt) {
-        Ok(t) => t,
+    let prompt = match (&st.vision, media.is_empty()) {
+        (Some(vc), false) => mm::build_prompt(&st.tok, vc, &text, media),
+        _ => st.tok.encode(&text).map(Prompt::text),
+    };
+    let prompt = match prompt {
+        Ok(p) => p,
         Err(e) => return bad_request(format!("{e:#}")),
     };
-    if tokens.len() >= st.ctx {
-        return bad_request(format!("prompt is {} tokens; the server context size is {}", tokens.len(), st.ctx));
+    if prompt.tokens.len() >= st.ctx {
+        return bad_request(format!("prompt is {} tokens; the server context size is {}", prompt.tokens.len(), st.ctx));
     }
     // Snapshot right before the final assistant header so the next turn can reuse the history.
-    let snapshot_at = st.im_start.and_then(|id| tokens.iter().rposition(|&t| t == id));
+    let snapshot_at = st.im_start.and_then(|id| prompt.tokens.iter().rposition(|&t| t == id));
     let c = common(&st, &b);
-    let rx = submit(&st, tokens, snapshot_at, &c);
+    let rx = submit(&st, prompt, snapshot_at, &c);
     let parser = OutputParser::new(thinking, st.cfg.separate_reasoning, tools.is_some());
     let id = new_id("chatcmpl");
     if c.stream {
@@ -389,7 +408,7 @@ async fn completions(State(st): State<Shared>, Json(b): Json<Value>) -> Response
     if b.get("max_tokens").is_none() {
         c.max_tokens = 16.max(c.max_tokens.min(256));
     }
-    let mut rx = submit(&st, tokens, None, &c);
+    let mut rx = submit(&st, Prompt::text(tokens), None, &c);
     let id = new_id("cmpl");
     let model = st.cfg.model_name.clone();
     if c.stream {

@@ -210,6 +210,7 @@ impl App {
             }
             Some(c) => {
                 let (state, color) = match c.phase {
+                    Phase::Encoding { .. } => ("● Encoding images", Color::Yellow),
                     Phase::Prefill { .. } => ("● Reading prompt", PREFILL),
                     Phase::Decode { .. } => ("● Generating", GEN),
                 };
@@ -222,6 +223,11 @@ impl App {
                     fmt_dur(c.started.elapsed().as_secs_f64())
                 )));
                 match c.phase {
+                    Phase::Encoding { done, total } => (
+                        format!("media {} / {total}", done + 1),
+                        done as f64 / total.max(1) as f64,
+                        Color::Yellow,
+                    ),
                     Phase::Prefill { done, total } => (
                         format!("prompt {done} / {total} tok"),
                         done as f64 / total.max(1) as f64,

@@ -22,7 +22,10 @@ struct Params {
     rope_theta: f32,
     eps: f32,
     scale: f32,
-    _pad: u32,
+    // Interleaved M-RoPE: frequency i uses the height position if i % 3 == 1 and
+    // i < mrope >> 16, the width position if i % 3 == 2 and i < mrope & 0xffff,
+    // and the temporal position otherwise.
+    mrope: u32,
 }
 
 const HD: u32 = 256u;
@@ -36,6 +39,7 @@ const HD: u32 = 256u;
 @group(0) @binding(6) var<storage, read> norms: array<f32>;          // q_norm[256] | k_norm[256]
 @group(0) @binding(7) var<storage, read_write> out: array<f32>;      // [M, n_heads * 256]
 @group(0) @binding(8) var<storage, read_write> partial: array<f32>;  // split-K scratch
+@group(0) @binding(9) var<storage, read> rpos: array<vec4<u32>>;     // [M] rotary (t, h, w) positions
 
 var<workgroup> sh: array<f32, 256>;
 var<workgroup> red: array<f32, 256>;
@@ -92,7 +96,14 @@ fn prep(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     if (d < p.rot_dim) {
         let fi = d % half_rot;
         let inv_freq = pow(p.rope_theta, -f32(2u * fi) / f32(p.rot_dim));
-        let ang = f32(pos) * inv_freq;
+        let rp = rpos[m];
+        var rot_pos = rp.x;
+        if (fi % 3u == 1u && fi < (p.mrope >> 16u)) {
+            rot_pos = rp.y;
+        } else if (fi % 3u == 2u && fi < (p.mrope & 0xffffu)) {
+            rot_pos = rp.z;
+        }
+        let ang = f32(rot_pos) * inv_freq;
         let cs = cos(ang);
         let sn = sin(ang);
         if (d < half_rot) {

@@ -18,8 +18,11 @@ the `openai` SDKs, ...) can use it.
   full attention with partial RoPE, the looped middle block (layers 4–27 run
   twice with shared weights) and the 2-stream mHC hyper-connections with
   Sinkhorn routing. Logits were checked against a PyTorch FP32 reference.
+* **Images and video** — the model's vision encoder runs on the GPU too, with
+  the same preprocessing and 3D (M-RoPE) positions as the reference
+  implementation.
 * **OpenAI API** — `/v1/chat/completions` (streaming, tool calling,
-  `reasoning_content`), `/v1/completions`, `/v1/models`.
+  `reasoning_content`, image and video inputs), `/v1/completions`, `/v1/models`.
 * **Prefix caching** — multi-turn chats and agent loops reuse the already
   processed conversation instead of re-reading it every turn.
 
@@ -33,8 +36,10 @@ cargo build --release
 ./target/release/sensenova-loop pull
 ```
 
-`pull` downloads the official weights (~38 GB) and quantizes them into a
-single file (Q8_0 by default, ~10 GB). Use `--quant q4_0` for a ~7 GB file that
+`pull` downloads the official weights (~38 GB) and quantizes them (Q8_0 by
+default, ~10 GB, plus a 0.5 GB `vision.snl` for the image encoder). If you
+pulled before vision support existed, run `pull` again: it skips what is
+already downloaded and converted and only adds the vision encoder. Use `--quant q4_0` for a ~7 GB file that
 fits smaller GPUs, and `--delete-source` to remove the 38 GB download afterwards.
 Set `HF_TOKEN` if you need authenticated downloads. Interrupted downloads resume.
 
@@ -49,6 +54,15 @@ Or answer a single prompt:
 ```bash
 ./target/release/sensenova-loop run -p "Explain looped transformers in two sentences." --no-think
 ```
+
+Ask about an image or a video:
+
+```bash
+./target/release/sensenova-loop run --image photo.jpg -p "What is in this picture?"
+```
+
+In the interactive chat, `/image <path or URL>` and `/video <path or URL>`
+attach media to your next message.
 
 ## OpenAI-compatible server
 
@@ -97,6 +111,34 @@ Supported request fields: `messages`, `stream`, `stream_options.include_usage`,
 Clients that expect `<think>` tags inline in the content can use
 `--inline-reasoning`.
 
+**Images and video** use the usual OpenAI content parts. Media can be a
+`data:` URL (base64) or an `http(s)` URL:
+
+```python
+reply = client.chat.completions.create(
+    model="sensenova_loop",
+    messages=[{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        {"type": "text", "text": "What is in this picture?"},
+    ]}],
+)
+```
+
+Videos use `{"type": "video_url", "video_url": {"url": "..."}}`, or
+`{"type": "video", "video": [frame URLs...], "fps": 2}` for a list of frames.
+Animated GIF and WebP are decoded natively; other video formats (MP4, WebM,
+MOV, ...) need `ffmpeg` and `ffprobe` on your PATH. As in the reference
+processor, videos are sampled at 2 frames per second and each pair of frames
+becomes one block of vision tokens labelled with its timestamp. Follow-up
+turns reuse the already processed image instead of encoding it again.
+
+Each 32x32 pixel area of an image becomes one prompt token, so image size
+drives cost. Images are resized to at most `--max-image-pixels` (default
+1 MP, about 1000 tokens); videos share `--max-video-pixels` (default 8 MP)
+across at most `--max-video-frames` (default 64) frames. Raise these for fine
+detail; the model itself accepts up to 16 MP per image. Clients cannot read
+files on the server unless you pass `--allow-local-media`.
+
 **Tool calling** follows the OpenAI format: the model's `<tool_call>` output is
 parsed into `tool_calls` with JSON `arguments`, and `tool` role messages are
 fed back through the model's chat template.
@@ -121,6 +163,8 @@ Options shared by `run`, `serve` and `bench`:
 * `--quant q8_0|q4_0` — choose between converted variants.
 * `--ctx <tokens>` — context size; the KV cache is allocated up front (default 32768).
 * `--backend vulkan|dx12|metal|gl` and `--device <index>` — pick the GPU (see `devices`).
+* `--no-vision` — skip loading the vision encoder (saves ~0.5 GB of GPU memory).
+* `--max-image-pixels`, `--max-video-pixels`, `--max-video-frames` — media size limits.
 * Sampling defaults: `--temperature 1.0 --top-p 0.95 --top-k 20` (from the
   model's generation config); `--max-tokens 8192`.
 
@@ -138,6 +182,10 @@ Measured on an RTX 5080 (16 GB, Vulkan, Windows 11):
 | Q8_0 | 10.1 GB | ~380 tok/s | ~36 tok/s |
 | Q4_0 | 7.2 GB | ~420 tok/s | ~42 tok/s |
 
+The vision encoder takes about 0.4 s for an 800x600 image (475 tokens) and
+about 1 s at the default 1 MP limit; reading the resulting image tokens into
+the language model then runs at the prompt-processing speed above.
+
 Because the looped block runs twice, every token executes 56 decoder layers,
 so the model costs about as much per token as a ~14B dense model.
 
@@ -150,8 +198,7 @@ lower `--ctx` or use `--quant q4_0`. On Windows, prefer the Vulkan backend
 
 ## Limitations
 
-* Text only for now: the vision encoder is not implemented, and requests with
-  image or video parts are rejected with a 400 error.
+* Video files other than animated GIF/WebP need `ffmpeg` installed.
 * One request is processed at a time; concurrent requests are queued.
 * Multi-token prediction (MTP) speculative decoding is not used.
 
@@ -163,5 +210,8 @@ the looped block, while each visit has its own KV cache or recurrent state.
 Kernels live in `src/shaders/`: quantized matrix-vector and tiled matrix
 multiplication (`matmul.wgsl`), Gated DeltaNet (`linear.wgsl`), GQA attention
 with split-K decoding (`attention.wgsl`), and norms / mHC routing / SwiGLU
-(`layers.wgsl`). The chat template is rendered with MiniJinja, exactly as
-shipped with the model.
+(`layers.wgsl`). The vision tower (`src/vision.rs`, `vision.wgsl`) reuses the
+quantized matmuls and adds LayerNorm, 2D RoPE and bidirectional attention
+kernels; its output features replace the image placeholder tokens' embeddings,
+and `src/mm.rs` handles preprocessing and the M-RoPE positions. The chat
+template is rendered with MiniJinja, exactly as shipped with the model.

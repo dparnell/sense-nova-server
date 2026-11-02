@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::chat::{ChatTemplate, OutputParser, Piece, Tokenizer};
+use crate::config::VisionConfig;
+use crate::mm::{self, Limits, Media, MediaRef, Prompt};
 use crate::sampler::SamplingParams;
 use crate::worker::{GenEvent, GenRequest};
 
@@ -18,6 +20,8 @@ pub struct ChatOptions {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub stats: bool,
+    pub vision: Option<VisionConfig>,
+    pub limits: Limits,
 }
 
 const DIM: &str = "\x1b[2m";
@@ -29,12 +33,31 @@ pub fn run(
     template: &ChatTemplate,
     mut opts: ChatOptions,
     prompt: Option<String>,
+    attach: Vec<MediaRef>,
 ) -> Result<()> {
     let im_start = tok.token_id("<|im_start|>");
     let mut history: Vec<Value> = Vec::new();
+    // Media of every message in `history`, in order, and media waiting for the next message.
+    let mut history_media: Vec<Arc<Media>> = Vec::new();
+    let mut pending_media: Vec<Arc<Media>> = Vec::new();
+    let attach_media = |refs: &[MediaRef], pending: &mut Vec<Arc<Media>>| -> Result<()> {
+        if opts.vision.is_none() {
+            bail!("image and video inputs need the vision encoder (run `sensenova-loop pull` to add it, and do not pass --no-vision)");
+        }
+        for m in mm::load_media(refs, &opts.limits)? {
+            eprintln!(
+                "(attached {}: {} tokens)",
+                if m.kind == mm::MediaKind::Image { "image".to_string() } else { format!("video, {} frame pairs", m.frames) },
+                m.tokens()
+            );
+            pending.push(m);
+        }
+        Ok(())
+    };
+    attach_media(&attach, &mut pending_media)?;
     let one_shot = prompt.is_some();
     if !one_shot {
-        eprintln!("Type a message. Commands: /think, /nothink, /reset, /system <text>, /exit");
+        eprintln!("Type a message. Commands: /image <path or URL>, /video <path or URL>, /think, /nothink, /reset, /system <text>, /exit");
     }
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -60,8 +83,21 @@ pub fn run(
         }
         match input.split_once(' ').map_or((input.as_str(), ""), |(a, b)| (a, b)) {
             ("/exit" | "/quit", _) => return Ok(()),
+            ("/image" | "/video", "") => {
+                eprintln!("usage: {} <path or URL>", input);
+                continue;
+            }
+            (cmd @ ("/image" | "/video"), src) => {
+                let r = if cmd == "/image" { MediaRef::Image(src.trim().into()) } else { MediaRef::Video(src.trim().into()) };
+                if let Err(e) = attach_media(&[r], &mut pending_media) {
+                    eprintln!("{e:#}");
+                }
+                continue;
+            }
             ("/reset", _) => {
                 history.clear();
+                history_media.clear();
+                pending_media.clear();
                 eprintln!("(conversation cleared)");
                 continue;
             }
@@ -78,6 +114,7 @@ pub fn run(
             ("/system", text) => {
                 opts.system = (!text.is_empty()).then(|| text.to_string());
                 history.clear();
+                history_media.clear();
                 eprintln!("(system prompt set, conversation cleared)");
                 continue;
             }
@@ -88,18 +125,31 @@ pub fn run(
             _ => {}
         }
 
-        history.push(json!({"role": "user", "content": input}));
+        if pending_media.is_empty() {
+            history.push(json!({"role": "user", "content": input}));
+        } else {
+            let mut parts: Vec<Value> = pending_media
+                .iter()
+                .map(|m| json!({"type": if m.kind == mm::MediaKind::Image { "image" } else { "video" }}))
+                .collect();
+            parts.push(json!({"type": "text", "text": input}));
+            history.push(json!({"role": "user", "content": parts}));
+            history_media.append(&mut pending_media);
+        }
         let mut messages = Vec::new();
         if let Some(s) = &opts.system {
             messages.push(json!({"role": "system", "content": s}));
         }
         messages.extend(history.iter().cloned());
         let text = template.render(&messages, None, opts.thinking)?;
-        let tokens = tok.encode(&text)?;
+        let prompt = match &opts.vision {
+            Some(vc) if !history_media.is_empty() => mm::build_prompt(&tok, vc, &text, history_media.clone())?,
+            _ => Prompt::text(tok.encode(&text)?),
+        };
         let (etx, mut erx) = unbounded_channel();
         tx.send(GenRequest {
-            snapshot_at: im_start.and_then(|id| tokens.iter().rposition(|&t| t == id)),
-            prompt: tokens,
+            snapshot_at: im_start.and_then(|id| prompt.tokens.iter().rposition(|&t| t == id)),
+            prompt,
             params: opts.params.clone(),
             max_tokens: opts.max_tokens,
             stop: Vec::new(),

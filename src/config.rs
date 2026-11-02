@@ -16,6 +16,9 @@ pub struct ModelConfig {
     pub head_dim: usize,
     pub rot_dim: usize,
     pub rope_theta: f32,
+    /// Interleaved M-RoPE frequency counts for (temporal, height, width).
+    #[serde(default = "default_mrope")]
+    pub mrope_section: [usize; 3],
     pub lin_k_heads: usize,
     pub lin_v_heads: usize,
     pub lin_k_dim: usize,
@@ -28,6 +31,46 @@ pub struct ModelConfig {
     pub mhc: Option<MhcConfig>,
     pub eos: Vec<u32>,
     pub max_position: usize,
+    /// Vision tower, absent in weight files converted before vision support.
+    #[serde(default)]
+    pub vision: Option<VisionConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VisionConfig {
+    pub hidden: usize,
+    /// MLP width, and the same padded to a multiple of the quantization block.
+    pub intermediate: usize,
+    pub intermediate_padded: usize,
+    pub depth: usize,
+    pub n_heads: usize,
+    pub patch: usize,
+    pub temporal_patch: usize,
+    pub merge: usize,
+    pub out_hidden: usize,
+    /// The learned position table is a square grid of this many patches per side.
+    pub pos_side: usize,
+    pub image_token: u32,
+    pub video_token: u32,
+    pub vision_start: u32,
+    pub vision_end: u32,
+}
+
+impl VisionConfig {
+    pub fn head_dim(&self) -> usize {
+        self.hidden / self.n_heads
+    }
+    /// Values per flattened patch: channels x frames x pixels.
+    pub fn patch_dim(&self) -> usize {
+        3 * self.temporal_patch * self.patch * self.patch
+    }
+    pub fn merged_dim(&self) -> usize {
+        self.hidden * self.merge * self.merge
+    }
+}
+
+fn default_mrope() -> [usize; 3] {
+    [11, 11, 10]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,6 +102,9 @@ impl ModelConfig {
             .get("partial_rotary_factor")
             .and_then(Value::as_f64)
             .unwrap_or(1.0);
+        if rope.get("mrope_section").is_some() && rope.get("mrope_interleaved").and_then(Value::as_bool) == Some(false) {
+            bail!("non-interleaved M-RoPE is not supported");
+        }
         let lp = config.get("loop_settings").context("config.json: missing loop_settings")?;
         let mhc = match config.get("mhc") {
             Some(m) if !m.is_null() => {
@@ -100,6 +146,10 @@ impl ModelConfig {
             head_dim,
             rot_dim: (head_dim as f64 * partial) as usize,
             rope_theta: rope.get("rope_theta").and_then(Value::as_f64).unwrap_or(1e7) as f32,
+            mrope_section: match rope.get("mrope_section").and_then(Value::as_array) {
+                Some(a) if a.len() == 3 => [0, 1, 2].map(|i| a[i].as_u64().unwrap_or(0) as usize),
+                _ => default_mrope(),
+            },
             lin_k_heads: u(t, "linear_num_key_heads")?,
             lin_v_heads: u(t, "linear_num_value_heads")?,
             lin_k_dim: u(t, "linear_key_head_dim")?,
@@ -112,6 +162,30 @@ impl ModelConfig {
             mhc,
             eos,
             max_position: u(t, "max_position_embeddings").unwrap_or(262_144),
+            vision: match config.get("vision_config") {
+                Some(v) if !v.is_null() => {
+                    let tok = |k: &str| u(config, k).map(|x| x as u32);
+                    let inter = u(v, "intermediate_size")?;
+                    let pos = u(v, "num_position_embeddings")?;
+                    Some(VisionConfig {
+                        hidden: u(v, "hidden_size")?,
+                        intermediate: inter,
+                        intermediate_padded: inter.div_ceil(32) * 32,
+                        depth: u(v, "depth")?,
+                        n_heads: u(v, "num_heads")?,
+                        patch: u(v, "patch_size")?,
+                        temporal_patch: u(v, "temporal_patch_size")?,
+                        merge: u(v, "spatial_merge_size")?,
+                        out_hidden: u(v, "out_hidden_size")?,
+                        pos_side: (pos as f64).sqrt() as usize,
+                        image_token: tok("image_token_id")?,
+                        video_token: tok("video_token_id")?,
+                        vision_start: tok("vision_start_token_id")?,
+                        vision_end: tok("vision_end_token_id")?,
+                    })
+                }
+                _ => None,
+            },
         };
         cfg.validate()?;
         Ok(cfg)
@@ -128,6 +202,7 @@ impl ModelConfig {
             (self.n_heads == 4 * self.n_kv_heads, "attention must have 4 query heads per KV head"),
             (self.lin_v_heads % self.lin_k_heads == 0, "linear value heads must be a multiple of key heads"),
             (self.rot_dim % 2 == 0 && self.rot_dim <= self.head_dim, "invalid rotary dim"),
+            (self.mrope_section.iter().sum::<usize>() == self.rot_dim / 2, "M-RoPE sections must cover the rotary dims"),
             (
                 self.loop_start < self.loop_end && self.loop_end <= self.n_layers && self.loop_count >= 1,
                 "invalid loop range",
@@ -136,6 +211,20 @@ impl ModelConfig {
         for (ok, msg) in checks {
             if !ok {
                 bail!("unsupported model configuration: {msg}");
+            }
+        }
+        if let Some(v) = &self.vision {
+            let checks = [
+                (v.head_dim() == 72, "vision head dim must be 72"),
+                (v.patch == 16 && v.temporal_patch == 2 && v.merge == 2, "vision patches must be 16x16x2 with 2x2 merge"),
+                (v.hidden % 32 == 0 && v.hidden <= 4096, "unsupported vision hidden size"),
+                (v.out_hidden == self.hidden, "vision output must match the text hidden size"),
+                (v.pos_side * v.pos_side > 0, "invalid vision position table"),
+            ];
+            for (ok, msg) in checks {
+                if !ok {
+                    bail!("unsupported vision configuration: {msg}");
+                }
             }
         }
         if let Some(m) = &self.mhc {

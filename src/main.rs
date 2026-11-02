@@ -3,12 +3,14 @@ mod config;
 mod convert;
 mod download;
 mod engine;
+mod mm;
 mod gpu;
 mod repl;
 mod sampler;
 mod server;
 mod stats;
 mod tui;
+mod vision;
 mod weights;
 mod worker;
 
@@ -87,6 +89,14 @@ enum Command {
         /// Print token counts and speed after each answer.
         #[arg(long)]
         stats: bool,
+        /// Attach an image (path or URL) to the first message; repeatable.
+        #[arg(long)]
+        image: Vec<String>,
+        /// Attach a video (path or URL) to the first message; repeatable.
+        #[arg(long)]
+        video: Vec<String>,
+        #[command(flatten)]
+        media: MediaArgs,
     },
     /// Serve an OpenAI-compatible API (/v1/chat/completions, /v1/completions, /v1/models).
     Serve {
@@ -110,6 +120,11 @@ enum Command {
         /// Print plain log lines instead of the live dashboard.
         #[arg(long)]
         no_tui: bool,
+        #[command(flatten)]
+        media: MediaArgs,
+        /// Let clients reference media by local file path or file:// URL.
+        #[arg(long)]
+        allow_local_media: bool,
     },
     /// Measure prompt processing and generation speed.
     Bench {
@@ -119,6 +134,16 @@ enum Command {
         prompt_tokens: usize,
         #[arg(long, default_value_t = 128)]
         gen_tokens: usize,
+    },
+    /// Preprocess an image and run the vision tower, writing inputs and outputs for comparison.
+    #[command(hide = true)]
+    VisionTest {
+        #[command(flatten)]
+        model: ModelArgs,
+        image: PathBuf,
+        out: PathBuf,
+        #[arg(long, default_value_t = 1 << 20)]
+        max_pixels: usize,
     },
     /// Print the top next-token logits for a text (for checking against a reference implementation).
     #[command(hide = true)]
@@ -131,6 +156,14 @@ enum Command {
         stepwise: bool,
         #[arg(long, default_value_t = 10)]
         top: usize,
+        /// Image for the `<|vision_start|><|image_pad|><|vision_end|>` placeholder in the text.
+        #[arg(long)]
+        image: Option<PathBuf>,
+        #[arg(long, default_value_t = 1 << 20)]
+        max_pixels: usize,
+        /// Write tokens, positions and patches here for a reference implementation.
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
 }
 
@@ -151,6 +184,33 @@ struct ModelArgs {
     /// GPU index from `devices`.
     #[arg(long, env = "SENSENOVA_DEVICE")]
     device: Option<usize>,
+    /// Skip loading the vision encoder (text only, saves ~0.5 GB of GPU memory).
+    #[arg(long)]
+    no_vision: bool,
+}
+
+#[derive(Args)]
+struct MediaArgs {
+    /// Largest image size in pixels after resizing (each 32x32 pixels is one prompt token).
+    #[arg(long, default_value_t = 1024 * 1024)]
+    max_image_pixels: usize,
+    /// Pixel budget for a whole video, summed over its sampled frames.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    max_video_pixels: usize,
+    /// Most frames sampled from a video (at 2 frames per second).
+    #[arg(long, default_value_t = 64)]
+    max_video_frames: usize,
+}
+
+impl MediaArgs {
+    fn limits(&self, allow_local_files: bool) -> mm::Limits {
+        mm::Limits {
+            max_image_pixels: self.max_image_pixels,
+            max_video_pixels: self.max_video_pixels,
+            max_frames: self.max_video_frames,
+            allow_local_files,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -202,6 +262,8 @@ fn repo_dir(root: &Path, repo: &str) -> PathBuf {
     repo.split('/').fold(root.to_path_buf(), |p, s| p.join(s))
 }
 
+const VISION_FILE: &str = "vision.snl";
+
 fn snl_name(quant: DType) -> String {
     format!("model-{}.snl", quant.name())
 }
@@ -216,8 +278,21 @@ fn convert_into(source: &Path, out_dir: &Path, quant: DType, name: &str) -> Resu
         }
     }
     let dst = out_dir.join(snl_name(quant));
-    println!("Converting to {} ...", dst.display());
-    convert::convert(source, &dst, quant, name)?;
+    if weights::WeightFile::open(&dst).is_ok() {
+        println!("{} is already converted", dst.display());
+    } else {
+        println!("Converting to {} ...", dst.display());
+        convert::convert(source, &dst, quant, name, convert::Part::Text)?;
+    }
+    let vision = out_dir.join(VISION_FILE);
+    let has_vision = std::fs::read(source.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|c| c.get("vision_config").is_some_and(|v| !v.is_null()));
+    if has_vision && weights::WeightFile::open(&vision).is_err() {
+        println!("Converting the vision encoder to {} ...", vision.display());
+        convert::convert(source, &vision, DType::Q8_0, name, convert::Part::Vision)?;
+    }
     Ok(dst)
 }
 
@@ -254,7 +329,9 @@ fn load(cli: &Cli, m: &ModelArgs) -> Result<Loaded> {
     let gpu = Gpu::new(m.backend.as_deref(), m.device)?;
     eprintln!("GPU: {} ({:?}, {:?})", gpu.info.name, gpu.info.backend, gpu.info.device_type);
     let t = Instant::now();
-    let engine = Engine::load(gpu, &file, m.ctx)?;
+    let vision_file = dir.join(VISION_FILE);
+    let vision = (!m.no_vision && vision_file.exists()).then_some(vision_file.as_path());
+    let engine = Engine::load(gpu, &file, m.ctx, vision)?;
     eprintln!(
         "Loaded {} [{}] in {:.1}s, context {} tokens, {:.1} GB of GPU memory",
         file.display(),
@@ -297,8 +374,10 @@ fn main() -> Result<()> {
                 println!("[{i}] {} ({:?}, {:?}) driver: {} {}", a.name, a.backend, a.device_type, a.driver, a.driver_info);
             }
         }
-        Command::Run { model, sampling, prompt, system, hide_reasoning, stats } => {
+        Command::Run { model, sampling, prompt, system, hide_reasoning, stats, image, video, media } => {
             let l = load(&cli, model)?;
+            let vision = l.engine.vision.as_ref().map(|v| v.cfg.clone());
+            let attach = image.iter().map(|s| mm::MediaRef::Image(s.clone())).chain(video.iter().map(|s| mm::MediaRef::Video(s.clone()))).collect();
             let tx = worker::spawn(l.engine, l.tok.clone(), Arc::new(Stats::new(Output::Quiet)));
             repl::run(
                 tx,
@@ -311,12 +390,16 @@ fn main() -> Result<()> {
                     params: sampling.params(),
                     max_tokens: sampling.max_tokens,
                     stats: *stats,
+                    vision,
+                    limits: media.limits(true),
                 },
                 prompt.clone(),
+                attach,
             )?;
         }
-        Command::Serve { model, sampling, host, port, api_key, served_model_name, inline_reasoning, no_tui } => {
+        Command::Serve { model, sampling, host, port, api_key, served_model_name, inline_reasoning, no_tui, media, allow_local_media } => {
             let l = load(&cli, model)?;
+            let vision = l.engine.vision.as_ref().map(|v| v.cfg.clone());
             let ctx = l.engine.ctx;
             let im_start = l.tok.token_id("<|im_start|>");
             let addr = format!("{host}:{port}");
@@ -346,6 +429,8 @@ fn main() -> Result<()> {
                 im_start,
                 ctx,
                 stats: stats.clone(),
+                vision,
+                limits: media.limits(*allow_local_media),
             });
             tokio::runtime::Runtime::new()?.block_on(async move {
                 let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
@@ -369,7 +454,65 @@ fn main() -> Result<()> {
                 anyhow::Ok(())
             })?;
         }
-        Command::Logits { model, text, stepwise, top } => {
+        Command::VisionTest { model, image, out, max_pixels } => {
+            let l = load(&cli, model)?;
+            let limits = mm::Limits { max_image_pixels: *max_pixels, max_video_pixels: *max_pixels, max_frames: 768, allow_local_files: true };
+            let bytes = std::fs::read(image)?;
+            let ext = image.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let media = if ext == "gif" { mm::video_from_bytes(&bytes, &limits)? } else { mm::image_from_bytes(&bytes, &limits)? };
+            let t = Instant::now();
+            let feats = l.engine.encode_media(&media)?;
+            let first = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let _ = l.engine.encode_media(&media)?;
+            println!(
+                "{:?}: {} frame(s) of {}x{} patches -> {} tokens; encode {:.0} ms (first run {:.0} ms)",
+                media.kind, media.frames, media.h, media.w, media.tokens(), t.elapsed().as_secs_f64() * 1e3, first * 1e3
+            );
+            std::fs::create_dir_all(out)?;
+            std::fs::write(out.join("patches.bin"), bytemuck::cast_slice(&media.patches))?;
+            std::fs::write(out.join("features.bin"), bytemuck::cast_slice(&feats))?;
+            std::fs::write(
+                out.join("meta.json"),
+                serde_json::to_string(&serde_json::json!({"frames": media.frames, "h": media.h, "w": media.w, "timestamps": media.timestamps}))?,
+            )?;
+        }
+        Command::Logits { model, text, stepwise, top, image: Some(image), max_pixels, dump } => {
+            let mut l = load(&cli, model)?;
+            let limits = mm::Limits { max_image_pixels: *max_pixels, max_video_pixels: *max_pixels, max_frames: 64, allow_local_files: true };
+            let media = Arc::new(mm::image_from_bytes(&std::fs::read(image)?, &limits)?);
+            let vc = l.engine.vision.as_ref().context("no vision encoder")?.cfg.clone();
+            let p = mm::build_prompt(&l.tok, &vc, text, vec![media.clone()])?;
+            let feats = l.engine.encode_media(&media)?;
+            let h = l.engine.cfg.hidden;
+            let start = p.runs[0].0;
+            let embeds: Vec<(usize, &[f32])> = (0..media.tokens()).map(|k| (start + k, &feats[k * h..(k + 1) * h])).collect();
+            let logits = if *stepwise {
+                let mut last = None;
+                for i in 0..p.tokens.len() {
+                    let e: Vec<(usize, &[f32])> = embeds.iter().filter(|(j, _)| *j == i).map(|(_, r)| (0, *r)).collect();
+                    last = l.engine.forward_mm(&p.tokens[i..i + 1], Some(&p.pos[i..i + 1]), &e, true)?;
+                }
+                last.unwrap()
+            } else {
+                l.engine.forward_mm(&p.tokens, Some(&p.pos), &embeds, true)?.unwrap()
+            };
+            println!("{} tokens, {} from the image ({}x{} patches)", p.tokens.len(), media.tokens(), media.h, media.w);
+            if let Some(d) = dump {
+                std::fs::create_dir_all(d)?;
+                std::fs::write(d.join("patches.bin"), bytemuck::cast_slice(&media.patches))?;
+                std::fs::write(
+                    d.join("prompt.json"),
+                    serde_json::to_string(&serde_json::json!({"tokens": p.tokens, "pos": p.pos, "grid": [media.frames, media.h, media.w]}))?,
+                )?;
+            }
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            for &i in idx.iter().take(*top) {
+                println!("{i:>8} {:>10.4} {:?}", logits[i], l.tok.decode(&[i as u32]));
+            }
+        }
+        Command::Logits { model, text, stepwise, top, .. } => {
             let mut l = load(&cli, model)?;
             let ids = l.tok.encode(text)?;
             println!("tokens: {ids:?}");

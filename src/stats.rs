@@ -24,6 +24,8 @@ pub enum Output {
 
 #[derive(Clone, Copy)]
 pub enum Phase {
+    /// Running the vision encoder over attached images and videos.
+    Encoding { done: usize, total: usize },
     Prefill { done: usize, total: usize },
     Decode { generated: usize, max: usize },
 }
@@ -139,6 +141,12 @@ impl Stats {
         }
     }
 
+    pub fn encoding(&self, done: usize, total: usize) {
+        if let Some(c) = &mut self.inner.lock().unwrap().current {
+            c.phase = Phase::Encoding { done, total };
+        }
+    }
+
     pub fn prefilled(&self, tokens: usize, secs: f64, pos: usize) {
         let mut s = self.inner.lock().unwrap();
         self.bucket(&mut s, |b| {
@@ -146,8 +154,13 @@ impl Stats {
             b.prefill_secs += secs;
         });
         s.context_used = pos;
-        if let Some(Current { phase: Phase::Prefill { done, .. }, .. }) = &mut s.current {
-            *done += tokens;
+        if let Some(c) = &mut s.current {
+            match &mut c.phase {
+                Phase::Prefill { done, .. } => *done += tokens,
+                // The first prompt chunk after encoding media.
+                Phase::Encoding { .. } => c.phase = Phase::Prefill { done: tokens, total: c.prompt - c.cached },
+                Phase::Decode { .. } => {}
+            }
         }
     }
 

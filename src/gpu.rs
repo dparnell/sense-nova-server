@@ -107,6 +107,11 @@ impl Gpu {
 
     pub fn storage(&self, label: &str, size: u64) -> wgpu::Buffer {
         self.allocated.set(self.allocated.get() + size);
+        self.scratch(label, size)
+    }
+
+    /// A storage buffer for short-lived work, not counted in `allocated`.
+    pub fn scratch(&self, label: &str, size: u64) -> wgpu::Buffer {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: size.max(16).div_ceil(4) * 4,
@@ -249,58 +254,62 @@ fn dequant8(wbase: u32, part: u32, scale: f32) -> array<f32, 8> {
 }
 "#;
 
+pub fn shader(dev: &wgpu::Device, label: &str, src: String) -> wgpu::ShaderModule {
+    dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) })
+}
+
+pub fn bind_layout(dev: &wgpu::Device, label: &str, binds: &[Bind]) -> wgpu::BindGroupLayout {
+    use Bind::*;
+    let entries: Vec<_> = binds
+        .iter()
+        .enumerate()
+        .map(|(i, b)| wgpu::BindGroupLayoutEntry {
+            binding: i as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: match b {
+                Uniform => wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                Read | ReadWrite => wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: matches!(b, Read) },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            },
+            count: None,
+        })
+        .collect();
+    dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries })
+}
+
+/// Kernels of one shader module share a bind group layout, so bind groups are interchangeable.
+pub fn pipeline(dev: &wgpu::Device, m: &wgpu::ShaderModule, entry: &str, bgl: &wgpu::BindGroupLayout) -> Kernel {
+    let bgl = bgl.clone();
+    let pl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(entry),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry),
+        layout: Some(&pl),
+        module: m,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Kernel { pipeline, layout: bgl }
+}
+
 impl Kernels {
     pub fn new(gpu: &Gpu) -> Result<Self> {
         use Bind::*;
         let dev = &gpu.device;
-        let module = |label: &str, src: String| {
-            dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)),
-            })
-        };
-        let layout = |label: &str, binds: &[Bind]| {
-            let entries: Vec<_> = binds
-                .iter()
-                .enumerate()
-                .map(|(i, b)| wgpu::BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: match b {
-                        Uniform => wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        Read | ReadWrite => wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: matches!(b, Read) },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                    },
-                    count: None,
-                })
-                .collect();
-            dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries })
-        };
-        // Kernels of one shader module share a bind group layout, so bind groups are interchangeable.
-        let kernel = |m: &wgpu::ShaderModule, entry: &str, bgl: &wgpu::BindGroupLayout| {
-            let bgl = bgl.clone();
-            let pl = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(entry),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-            let pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&pl),
-                module: m,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-            Kernel { pipeline, layout: bgl }
-        };
+        let module = |label: &str, src: String| shader(dev, label, src);
+        let layout = |label: &str, binds: &[Bind]| bind_layout(dev, label, binds);
+        let kernel = |m: &wgpu::ShaderModule, entry: &str, bgl: &wgpu::BindGroupLayout| pipeline(dev, m, entry, bgl);
 
         let mm_src = include_str!("shaders/matmul.wgsl");
         let q8 = module("matmul_q8", mm_src.replace("//QUANT_FNS//", Q8_FNS));
@@ -309,7 +318,7 @@ impl Kernels {
         let layers = module("layers", include_str!("shaders/layers.wgsl").into());
         let ly = layout("layers", &[Uniform, Uniform, ReadWrite, ReadWrite, Read, ReadWrite]);
         let attn = module("attention", include_str!("shaders/attention.wgsl").into());
-        let at = layout("attention", &[Uniform, Uniform, ReadWrite, ReadWrite, ReadWrite, ReadWrite, Read, ReadWrite, ReadWrite]);
+        let at = layout("attention", &[Uniform, Uniform, ReadWrite, ReadWrite, ReadWrite, ReadWrite, Read, ReadWrite, ReadWrite, Read]);
         let lin = module("linear", include_str!("shaders/linear.wgsl").into());
         let li = layout("linear", &[Uniform, Uniform, ReadWrite, ReadWrite, ReadWrite, ReadWrite, Read, ReadWrite]);
         let mats = |m: &wgpu::ShaderModule| [kernel(m, "matvec1", &mm), kernel(m, "matvec", &mm), kernel(m, "matmul", &mm)];
